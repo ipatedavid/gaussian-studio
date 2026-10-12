@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local application secrets/state
+desktop/.env
+desktop/service-account.json
+desktop/token.json
+desktop/app_state.json
+desktop/pod_ledger.json
+desktop/jobs.db
+desktop/pod_ledger.json.tmp
+desktop/logs/
+desktop/results/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+web/.build/
+web/site/

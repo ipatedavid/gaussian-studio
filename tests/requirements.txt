@@ -1,0 +1,2 @@
+# Test-only dependencies (the app itself does not need these).
+pillow

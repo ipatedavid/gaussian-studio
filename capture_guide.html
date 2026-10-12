@@ -1,0 +1,988 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Walk, Don't Pan</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,500..900&family=Atkinson+Hyperlegible:ital,wght@0,400;0,700;1,400&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: a surveyor's field notebook. Cool graph-paper ground, ink plan drawings,
+   survey-tape orange for the camera and its path, a three-step coverage scale. */
+:root {
+  color-scheme: light;
+  --paper: #F1F4F1;
+  --sheet: #E6ECE8;
+  --ink: #16211E;
+  --muted: #56655F;
+  --rule: #C6D0CB;
+  --grid: #DCE3DF;
+  --tape: #D9481F;        /* camera, path, accent */
+  --tape-soft: rgba(217, 72, 31, 0.14);
+  --seen: #D99A22;        /* seen from 1 direction */
+  --partial: #8DAA2A;     /* 2 directions */
+  --solid: #1F8F62;       /* 3+ directions */
+  --unseen: #B5C0BB;
+  --furniture: #CDD6D1;
+  --display: "Archivo", "Arial Narrow", "Helvetica Neue", Arial, sans-serif;
+  --body: "Atkinson Hyperlegible", "Segoe UI", system-ui, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  --step--1: 0.84rem;
+  --step-0: 1rem;
+  --step-1: 1.2rem;
+  --step-2: 1.6rem;
+  --step-3: clamp(2.2rem, 6vw, 3.6rem);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --paper: #0F1513;
+    --sheet: #17201D;
+    --ink: #E3EBE6;
+    --muted: #93A49D;
+    --rule: #2B3833;
+    --grid: #1A2420;
+    --tape: #FF7448;
+    --tape-soft: rgba(255, 116, 72, 0.16);
+    --seen: #E8AE3C;
+    --partial: #A9C845;
+    --solid: #39C08A;
+    --unseen: #3B4A44;
+    --furniture: #26322E;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --paper: #0F1513;
+  --sheet: #17201D;
+  --ink: #E3EBE6;
+  --muted: #93A49D;
+  --rule: #2B3833;
+  --grid: #1A2420;
+  --tape: #FF7448;
+  --tape-soft: rgba(255, 116, 72, 0.16);
+  --seen: #E8AE3C;
+  --partial: #A9C845;
+  --solid: #39C08A;
+  --unseen: #3B4A44;
+  --furniture: #26322E;
+}
+
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--body);
+  font-size: var(--step-0);
+  line-height: 1.55;
+  padding-inline: 20px;
+  padding-block: 0 64px;
+}
+.wrap { max-width: 1120px; margin-inline: auto; display: grid; gap: 64px; }
+h1, h2, h3 { font-family: var(--display); text-wrap: balance; margin: 0; line-height: 1.05; }
+h1 { font-size: var(--step-3); font-weight: 900; font-stretch: 118%; letter-spacing: -0.01em; }
+h2 { font-size: var(--step-2); font-weight: 800; font-stretch: 112%; }
+h3 { font-size: var(--step-1); font-weight: 700; font-stretch: 100%; }
+p { margin: 0; max-width: 65ch; }
+a { color: var(--tape); text-underline-offset: 3px; }
+a:focus-visible, button:focus-visible, input:focus-visible { outline: 2px solid var(--tape); outline-offset: 2px; }
+.label {
+  font-family: var(--mono); font-size: 0.72rem; letter-spacing: 0.12em;
+  text-transform: uppercase; color: var(--muted);
+}
+.mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+section { display: grid; gap: 20px; }
+.lede { font-size: var(--step-1); color: var(--muted); max-width: 60ch; }
+
+/* Masthead */
+header.mast {
+  display: grid; gap: 18px; padding-top: 48px;
+  border-bottom: 2px solid var(--ink); padding-bottom: 28px;
+}
+header.mast .meta { display: flex; flex-wrap: wrap; gap: 8px 24px; }
+
+/* Parallax demo */
+.parallax { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 20px; }
+.parallax figure { margin: 0; display: grid; gap: 10px; align-content: start; }
+.parallax canvas { width: 100%; aspect-ratio: 16 / 9; display: block; border: 1px solid var(--rule); background: var(--sheet); }
+.parallax figcaption { display: grid; gap: 4px; }
+.verdict { font-family: var(--display); font-weight: 800; font-stretch: 110%; font-size: var(--step-1); }
+.verdict.bad { color: var(--tape); }
+.verdict.good { color: var(--solid); }
+
+/* Answers */
+.answers { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 0; border-top: 1px solid var(--rule); }
+.answers article { display: grid; gap: 8px; align-content: start; padding: 18px 20px 18px 0; border-bottom: 1px solid var(--rule); }
+.answers article + article { padding-left: 20px; border-left: 1px solid var(--rule); }
+@media (max-width: 860px) { .answers article + article { padding-left: 0; border-left: 0; } }
+.answers .q { font-family: var(--display); font-weight: 700; font-stretch: 100%; font-size: var(--step-1); }
+
+/* Simulator */
+.sim { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 20px; align-items: start; }
+@media (max-width: 860px) { .sim { grid-template-columns: 1fr; } }
+.plan-box { display: grid; gap: 12px; }
+#plan { width: 100%; aspect-ratio: 7.6 / 5.6; display: block; background: var(--sheet); border: 1px solid var(--rule); }
+.tabs { display: flex; flex-wrap: wrap; gap: 6px; }
+.tabs button, .controls button {
+  font: 600 0.86rem/1 var(--body); color: var(--ink); background: transparent;
+  border: 1px solid var(--rule); padding: 9px 12px; cursor: pointer;
+}
+.tabs button[aria-pressed="true"] { background: var(--ink); color: var(--paper); border-color: var(--ink); }
+.tabs button .n { font-family: var(--mono); margin-right: 6px; color: var(--tape); }
+.tabs button[aria-pressed="true"] .n { color: var(--tape); }
+.controls { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.controls button[aria-pressed="true"] { border-color: var(--tape); color: var(--tape); }
+.controls .readout { margin-left: auto; font-family: var(--mono); font-size: 0.82rem; color: var(--muted); }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: var(--step--1); color: var(--muted); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.legend i { width: 18px; height: 5px; display: inline-block; }
+
+.panel { display: grid; gap: 14px; border-top: 3px solid var(--tape); padding-top: 14px; }
+.panel h3 { font-size: var(--step-2); font-stretch: 105%; }
+.specs { display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; margin: 0; font-size: 0.93rem; }
+.specs dt { font-family: var(--mono); font-size: 0.72rem; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); padding-top: 3px; }
+.specs dd { margin: 0; }
+#elev { width: 100%; aspect-ratio: 32 / 15; display: block; background: var(--sheet); border: 1px solid var(--rule); }
+.stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.stats div { display: grid; gap: 2px; }
+.stats b { font-family: var(--mono); font-size: 1.25rem; font-variant-numeric: tabular-nums; }
+
+/* Pocket card */
+.table-scroll { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; min-width: 640px; font-size: 0.95rem; }
+th, td { text-align: left; padding: 10px 12px 10px 0; border-bottom: 1px solid var(--rule); vertical-align: top; }
+th { font-family: var(--mono); font-size: 0.72rem; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); font-weight: 400; }
+table.fit { min-width: 0; }
+table.fit td.num { white-space: normal; }
+td.num { font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+td .n { font-family: var(--mono); color: var(--tape); margin-right: 6px; }
+
+/* Object rings diagram */
+.rings { margin: 0; display: grid; gap: 8px; max-width: 760px; }
+.rings svg { width: 100%; height: auto; display: block; background: var(--sheet); border: 1px solid var(--rule); }
+.r-table { stroke: var(--muted); stroke-width: 2; }
+.r-board rect { fill: var(--furniture); stroke: var(--muted); stroke-dasharray: 4 3; }
+.r-object { fill: var(--seen); stroke: var(--ink); stroke-width: 1.5; }
+.r-arc { fill: none; stroke: var(--rule); stroke-width: 2; stroke-dasharray: 6 6; }
+.r-cam circle { fill: var(--tape); }
+.r-cam line { stroke: var(--tape); stroke-width: 1.5; stroke-dasharray: 3 4; opacity: 0.8; }
+.r-cam.top circle { fill: var(--solid); }
+.r-cam.top line { stroke: var(--solid); }
+.r-label { fill: var(--ink); font: 600 17px var(--body); }
+.r-label.muted { fill: var(--muted); font-weight: 400; }
+
+/* Checklist and notes */
+.two { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 32px; }
+.check { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; }
+.check label { display: grid; grid-template-columns: 22px 1fr; gap: 10px; padding: 8px 0; border-bottom: 1px dashed var(--rule); cursor: pointer; }
+.check input { width: 18px; height: 18px; margin: 2px 0 0; accent-color: var(--solid); }
+.check input:checked + span { color: var(--muted); text-decoration: line-through; text-decoration-color: var(--rule); }
+.notes { display: grid; gap: 16px; }
+.notes div { display: grid; gap: 4px; }
+.notes h3 { font-size: 1.05rem; }
+.callout { background: var(--sheet); border-left: 3px solid var(--tape); padding: 14px 16px; display: grid; gap: 6px; }
+.sources { font-size: var(--step--1); color: var(--muted); columns: 2 280px; gap: 32px; padding-left: 18px; margin: 0; }
+.sources li { break-inside: avoid; margin-bottom: 6px; }
+footer { border-top: 2px solid var(--ink); padding-top: 18px; color: var(--muted); font-size: var(--step--1); }
+@media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="mast">
+  <span class="label">Field guide · room capture for Gaussian splats · phone video</span>
+  <h1>Walk, don't pan.</h1>
+  <p class="lede">Splat software works out depth by comparing how things shift between frames. That only happens when the camera moves through the room. Turning on the spot gives it nothing to measure.</p>
+  <div class="meta">
+    <span class="label">Pixel · 1× lens · 4K 30 fps</span>
+    <span class="label">One continuous take per job</span>
+    <span class="label">~0.35 m/s walking pace</span>
+  </div>
+</header>
+
+<section aria-labelledby="why">
+  <h2 id="why">What the software sees</h2>
+  <div class="parallax">
+    <figure>
+      <canvas id="pan" width="640" height="360" aria-label="Animation: panning in place moves near and far objects by the same amount"></canvas>
+      <figcaption>
+        <span class="verdict bad">Panning in place</span>
+        <span>The whole picture slides as one. The near plant and the far wall move together, so there is no depth to measure. Long swivels like this are frames the software often can't place.</span>
+      </figcaption>
+    </figure>
+    <figure>
+      <canvas id="walk" width="640" height="360" aria-label="Animation: walking sideways moves near objects much more than far ones"></canvas>
+      <figcaption>
+        <span class="verdict good">Walking sideways</span>
+        <span>The plant slides past the wall behind it. That difference in movement (parallax) is exactly what lets the software place every frame and every surface in 3D.</span>
+      </figcaption>
+    </figure>
+  </div>
+  <div class="answers">
+    <article>
+      <span class="q">Does panning break the dataset?</span>
+      <p>Turning while standing still adds frames with no depth in them, and fast turns blur. A slow turn while you keep walking is fine. A long swivel on the spot is what breaks things. The rule: <strong>only turn while your feet are moving.</strong></p>
+    </article>
+    <article>
+      <span class="q">Should the passes go in one video, like a spiral?</span>
+      <p>Yes. Shoot each pass as one continuous take, so its frames stay joined. A job can also take several videos, or photos and videos together. At the end of each lap, keep walking about a metre past where you started, then change height while walking. Each lap sees the same surfaces from a new height, which is what joins them together.</p>
+    </article>
+    <article>
+      <span class="q">Is there a known route for any room?</span>
+      <p>Yes. The usual indoor recipe is: laps around the edge at different heights looking across the room, then a loop in the middle looking out at the walls, then slow orbits around the important objects. The simulator below plays it.</p>
+    </article>
+  </div>
+</section>
+
+<section aria-labelledby="route">
+  <div style="display:grid;gap:8px">
+    <span class="label">Example room · 7 × 5 m living room with shelf, island, table and sofa</span>
+    <h2 id="route">Five passes, one take</h2>
+    <p>Each surface is painted as the camera sees it. The colour shows how many different directions it has been seen from: once, twice, or three or more times. Surfaces seen from only one direction are where floaters and smeared patches come from.</p>
+  </div>
+  <div class="sim">
+    <div class="plan-box">
+      <div class="tabs" role="group" aria-label="Choose a pass">
+        <button type="button" data-pass="0" aria-pressed="false"><span class="n">1</span>Eye-level lap</button>
+        <button type="button" data-pass="1" aria-pressed="false"><span class="n">2</span>High lap</button>
+        <button type="button" data-pass="2" aria-pressed="false"><span class="n">3</span>Low lap, reversed</button>
+        <button type="button" data-pass="3" aria-pressed="false"><span class="n">4</span>Centre, looking out</button>
+        <button type="button" data-pass="4" aria-pressed="false"><span class="n">5</span>Detail orbits</button>
+        <button type="button" data-pass="full" aria-pressed="true"><span class="n">∞</span>Full take</button>
+      </div>
+      <canvas id="plan" width="1140" height="840" aria-label="Top-down plan of the room showing the camera path and surface coverage"></canvas>
+      <div class="controls">
+        <button type="button" id="play" aria-pressed="false">Play</button>
+        <button type="button" id="restart">Restart</button>
+        <button type="button" id="speed" aria-label="Playback speed">Speed 8×</button>
+        <button type="button" id="cumulative" aria-pressed="true" title="Include the coverage of the earlier passes">Earlier passes: on</button>
+        <span class="readout" id="clock">0:00 of take</span>
+      </div>
+      <div class="legend" aria-label="Coverage legend">
+        <span><i style="background:var(--unseen)"></i>not seen</span>
+        <span><i style="background:var(--seen)"></i>1 direction</span>
+        <span><i style="background:var(--partial)"></i>2 directions</span>
+        <span><i style="background:var(--solid)"></i>3+ directions</span>
+        <span><i style="background:var(--tape)"></i>camera &amp; view</span>
+      </div>
+    </div>
+    <aside class="panel" aria-live="polite">
+      <span class="label" id="p-kicker">Full take</span>
+      <h3 id="p-title">All five passes, back to back</h3>
+      <dl class="specs">
+        <dt>Height</dt><dd id="p-height"></dd>
+        <dt>Tilt</dt><dd id="p-tilt"></dd>
+        <dt>Facing</dt><dd id="p-facing"></dd>
+        <dt>Where</dt><dd id="p-where"></dd>
+        <dt>Catches</dt><dd id="p-catches"></dd>
+      </dl>
+      <canvas id="elev" width="640" height="300" aria-label="Side view of camera height and tilt"></canvas>
+      <div class="stats">
+        <div><span class="label">Solid</span><b id="s-solid">0%</b></div>
+        <div><span class="label">Seen</span><b id="s-seen">0%</b></div>
+        <div><span class="label">Time</span><b id="s-time">0:00</b></div>
+      </div>
+    </aside>
+  </div>
+</section>
+
+<section aria-labelledby="card">
+  <h2 id="card">Pocket card</h2>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>Pass</th><th>Height</th><th>Tilt</th><th>Facing</th><th>Distance</th><th>Time (4×4 m room)</th></tr></thead>
+      <tbody>
+        <tr><td><span class="n">1</span>Eye-level lap</td><td class="num">≈1.5 m</td><td class="num">level</td><td>Across the room at the opposite wall</td><td class="num">≈1 m off the walls</td><td class="num">≈45 s</td></tr>
+        <tr><td><span class="n">2</span>High lap</td><td class="num">≈1.9 m</td><td class="num">down 30–40°</td><td>Across, turned ~35° toward where you're walking</td><td class="num">≈1 m</td><td class="num">≈45 s</td></tr>
+        <tr><td><span class="n">3</span>Low lap, reversed</td><td class="num">≈0.9 m</td><td class="num">up 15–20°</td><td>Across, ~35° toward the new walking direction</td><td class="num">≈1 m</td><td class="num">≈45 s</td></tr>
+        <tr><td><span class="n">4</span>Centre, looking out</td><td class="num">≈1.5 m</td><td class="num">level</td><td>Outward at the walls</td><td class="num">small loop mid-room</td><td class="num">≈30 s</td></tr>
+        <tr><td><span class="n">5</span>Detail orbits</td><td class="num">1.6 m, then 1.0 m</td><td class="num">down 30°, then 10°</td><td>The object, kept centred</td><td class="num">≈1 m from it</td><td class="num">≈40 s each</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Between passes, keep walking: overlap the first metre of the previous lap and change height while you move. A 4×4 m room takes roughly 4–5 minutes in total. Slower than feels natural is about right.</p>
+</section>
+
+<section aria-labelledby="before">
+  <div class="two">
+    <div style="display:grid;gap:14px">
+      <h2 id="before">Before you press record</h2>
+      <ul class="check" id="checklist">
+        <li><label><input type="checkbox" id="c1"><span>Every light on. Close blinds halfway so no sun patches cross the floor.</span></label></li>
+        <li><label><input type="checkbox" id="c2"><span>Nothing moving: people and pets out, TV and fans off, curtains still.</span></label></li>
+        <li><label><input type="checkbox" id="c3"><span>Main 1× lens, 4K, 30 fps. Avoid the ultra-wide unless the engine handles its distortion.</span></label></li>
+        <li><label><input type="checkbox" id="c4"><span>Lock focus and exposure: tap and hold a mid-brightness surface until the lock shows. Brightness jumping mid-take confuses the matching.</span></label></li>
+        <li><label><input type="checkbox" id="c5"><span>Stabilisation on Standard. Active, Locked and Cinematic pan crop and warp the frames.</span></label></li>
+        <li><label><input type="checkbox" id="c6"><span>Wipe the lens.</span></label></li>
+        <li><label><input type="checkbox" id="c7"><span>Decide your start point, walking direction, and which objects get orbits.</span></label></li>
+        <li><label><input type="checkbox" id="c8"><span>Cover big mirrors and switch off screens, or accept they will look wrong.</span></label></li>
+      </ul>
+    </div>
+    <div class="notes">
+      <h2>Trouble spots</h2>
+      <div><h3>Corners</h3><p>Round them: walk a quarter-circle about 0.7 m out while turning gradually, as the animation does. Never stop in the corner and swivel.</p></div>
+      <div><h3>Blank walls</h3><p>Keep an edge, a door frame or furniture in the picture. A frame of pure white wall can't be matched to anything. For big blank walls, a few sticky notes or posters help.</p></div>
+      <div><h3>Doorways and other rooms</h3><p>Shoot one room per take for now. If you must pass through, go slowly and keep part of both rooms in frame through the opening.</p></div>
+      <div><h3>Glass, mirrors, shiny floors</h3><p>Reflections move as you move, so they look like geometry that isn't there. Keep plenty of normal surfaces in frame and don't linger on them.</p></div>
+      <div><h3>Pace</h3><p>About one slow step per second. If a paused frame from your video looks smeared, you moved too fast for the light.</p></div>
+    </div>
+  </div>
+</section>
+
+<section aria-labelledby="objects">
+  <h2 id="objects">Small objects</h2>
+  <p class="lede">A pastry, a shoe, a sculpture: walk around the object in rings and take photos, not video. The object stays put and you move.</p>
+  <figure class="rings">
+    <svg viewBox="0 0 640 300" role="img" aria-labelledby="rings-title">
+      <title id="rings-title">Side view: three camera rings around an object on a patterned board, at about 10, 40 and 65 degrees down, plus a few shots from straight above.</title>
+      <line class="r-table" x1="40" y1="250" x2="600" y2="250"/>
+      <g class="r-board"><rect x="210" y="244" width="220" height="6"/></g>
+      <path class="r-object" d="M262 244 Q270 196 320 192 Q370 196 378 244 Z"/>
+      <path class="r-arc" d="M560 238 A 240 240 0 0 0 320 4"/>
+      <g class="r-cam"><circle cx="556" cy="200" r="7"/><line x1="556" y1="200" x2="380" y2="226"/></g>
+      <g class="r-cam"><circle cx="504" cy="96" r="7"/><line x1="504" y1="96" x2="370" y2="200"/></g>
+      <g class="r-cam"><circle cx="420" cy="30" r="7"/><line x1="420" y1="30" x2="345" y2="190"/></g>
+      <g class="r-cam top"><circle cx="320" cy="12" r="7"/><line x1="320" y1="12" x2="320" y2="186"/></g>
+      <text class="r-label" x="622" y="180" text-anchor="end">Low · ~10°</text>
+      <text class="r-label" x="520" y="90">Middle · ~40°</text>
+      <text class="r-label" x="436" y="26">High · ~65°</text>
+      <text class="r-label" x="300" y="18" text-anchor="end">Top</text>
+      <text class="r-label muted" x="320" y="282" text-anchor="middle">Patterned board: the solver's reference</text>
+    </svg>
+    <figcaption class="label">Side view · 35–50 cm from the object · same distance on every ring</figcaption>
+  </figure>
+  <div class="table-scroll">
+    <table class="fit">
+      <thead><tr><th>Ring</th><th>Camera</th><th>Photos</th></tr></thead>
+      <tbody>
+        <tr><td><span class="n">1</span>Low</td><td>Just above the table, tilted slightly down</td><td class="num">24–36 · one every 10–15°</td></tr>
+        <tr><td><span class="n">2</span>Middle</td><td>About 40° down</td><td class="num">24–36</td></tr>
+        <tr><td><span class="n">3</span>High</td><td>About 65° down</td><td class="num">18–24</td></tr>
+        <tr><td><span class="n">4</span>Top</td><td>Straight down, plus a few just off it</td><td class="num">4–6</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>About 80–120 photos, 5–10 minutes. Neighbouring photos should share about three quarters of the picture, so take small steps. Then copy them into a folder of their own and pick it in the app's <strong>Photos</strong> mode.</p>
+  <div class="two">
+    <div class="notes">
+      <h3>Set up</h3>
+      <div><p><strong>Patterned surface under it.</strong> A newspaper, a printed tea towel, a cutting board with grain. A plain white plate or table gives the camera solver nothing to lock onto.</p></div>
+      <div><p><strong>Move yourself, not the object.</strong> A turntable makes the background stand still while the object turns, which confuses the solver.</p></div>
+      <div><p><strong>Soft, steady light.</strong> An overcast window or two lamps bounced off a wall. No flash, and don't move the lights between rings. Glazed or shiny food is the lobby problem in miniature: soft light keeps highlights small.</p></div>
+      <div><p><strong>Be quick with food.</strong> Pastry dries and sugar settles. Don't touch it between rings.</p></div>
+    </div>
+    <div class="notes">
+      <h3>Fuji X-T20 with the XF35mm f/2</h3>
+      <dl class="specs">
+        <dt>Mode</dt><dd>Photos, not video: full 24 MP and no motion blur</dd>
+        <dt>Aperture</dt><dd>f/8, f/11 for tall objects. At 35–50 cm, f/2 leaves most of it blurred</dd>
+        <dt>Shutter</dt><dd>1/125 s or faster handheld, slower on a tripod</dd>
+        <dt>ISO</dt><dd>Auto, 200–6400. Spirula evens out the brightness differences</dd>
+        <dt>WB</dt><dd>Fixed for every photo</dd>
+        <dt>Focus</dt><dd>Manual, set once, then keep the same distance. Refocusing shifts the framing slightly</dd>
+        <dt>Film sim</dt><dd>Provia or Astia. Not Acros: training needs colour</dd>
+        <dt>Distance</dt><dd>The lens focuses from about 35 cm, where the frame is about 23 cm wide. Fill half to two thirds of it with the object</dd>
+      </dl>
+    </div>
+  </div>
+  <div class="callout">
+    <span class="label">In the app: object scan</span>
+    <p>Tick <strong>Object scan: cut away the background</strong> under Training. An AI model (BiRefNet) finds the object in every photo and masks out the board and the room, and Spirula trains with its object preset, so every splat goes into the object and there's nothing to crop afterwards. The camera solver still uses the whole photos, which is why the patterned board matters. It adds about 2–3 minutes on the pod. Also: <strong>fisheye off</strong>, vignetting correction off (the 35 mm hardly darkens at f/8), Floater suppression <strong>Mild</strong>, or Strong for a shiny glaze, and AI geometry guidance <strong>Surfaces</strong>. Standard or High quality.</p>
+  </div>
+</section>
+
+<section aria-labelledby="app">
+  <h2 id="app">In the Gaussian Studio app</h2>
+  <div class="two">
+    <div class="callout">
+      <span class="label">Frames per second</span>
+      <p>The app takes frames evenly through the whole video at the rate you set; 3 per second is the default, 2 for a small room. A 5-minute take at 2 fps is 600 frames, and training steps rise automatically for captures over 300 images. Past about 750 frames, lower the fps instead.</p>
+    </div>
+    <div class="callout">
+      <span class="label">Spirula Studio</span>
+      <p>Floater suppression <strong>Mild</strong> and AI geometry guidance <strong>Surfaces</strong> are a good start for rooms. Keep one Off/Off run of the same video as a baseline.</p>
+    </div>
+    <div class="callout">
+      <span class="label">Check the log</span>
+      <p>Look for <span class="mono">registered N of M images</span>. Above 90% is a healthy take. 70–90% means a stretch didn't connect, usually a swivel, a blurry burst or a blank wall. Under 60%, the job stops before training.</p>
+    </div>
+  </div>
+</section>
+
+<section aria-labelledby="live">
+  <h2 id="live">Live coverage while you record</h2>
+  <p>What you described (surfaces lighting up as you film them, per angle) is what the simulator above draws. I didn't find a ready-made Android app that does exactly this for video splat capture. The closest options:</p>
+  <div class="notes">
+    <div><h3>RealityScan Mobile (Epic, free, Android)</h3><p>Shows a live point cloud over the subject that marks where coverage is thin. It's built for objects rather than rooms, and it captures its own photos, not your video.</p></div>
+    <div><h3>Scaniverse or KIRI Engine</h3><p>They build a splat on or near the phone, so you can check a room minutes after shooting and reshoot gaps while you're still there.</p></div>
+    <div><h3>Ollidar (open source)</h3><p>Draws live coverage arcs while you walk, but needs a clip-on lidar.</p></div>
+    <div><h3>A custom app</h3><p>An Android app using ARCore tracking and depth could paint coverage exactly like the simulator while it records. It's possible, but it's a separate project.</p></div>
+  </div>
+  <p><strong>Self-check today:</strong> before leaving, scrub through the video. Any stretch where the picture smears, or where everything slides sideways together without near things passing far things, is a weak spot. Reshoot that part of the room as a short extra lap.</p>
+</section>
+
+<section aria-labelledby="src">
+  <h2 id="src">Sources</h2>
+  <ul class="sources">
+    <li><a href="https://realhorizons.ai/blog/indoor-gaussian-splatting-capture-guide/">Indoor Gaussian Splatting Capture Guide</a>: perimeter then centre, doorways, translation over rotation</li>
+    <li><a href="https://docs.reflct.app/capturing_gaussian_splats">Reflct: Capturing Gaussian Splats</a>: parallel wall passes, within 3 m, one frame per 0.5 s, overlap</li>
+    <li><a href="https://help.sketchup.com/en/gaussian-splats-best-practices">SketchUp: Best Practices for Gaussian Splats</a>: multiple heights, 70–80% overlap, blinds, slow movement</li>
+    <li><a href="https://www.kiriengine.app/blog/how-to-capture-3d-gaussian-splats-kiri-engine">KIRI Engine capture guide</a>: orbits at three heights, subject centred, move slower</li>
+    <li><a href="https://github.com/harry7557558/spirula-studio">Spirula Studio</a>: centered-object preset and subject masking with <a href="https://github.com/ZhengPeng7/BiRefNet">BiRefNet</a> (MIT)</li>
+    <li><a href="https://arxiv.org/pdf/2606.27071">PanoImager</a>: why rotation-only capture breaks structure from motion</li>
+    <li><a href="https://www.realityscan.com/mobile">RealityScan Mobile</a>: live coverage point cloud on Android</li>
+    <li><a href="https://github.com/Agtom-FN/Ollidar">Ollidar</a>: live coverage arcs with ARCore and lidar</li>
+    <li><a href="https://medium.com/@Jamesroha/gaussian-splatting-a-complete-student-guide-to-3d-capture-in-2026-1195a6265870">Gaussian splatting student guide (2026)</a>: lens choice, exposure lock</li>
+  </ul>
+</section>
+
+<footer>Made for Gaussian Studio. The simulator is a simplified top-down model: it ignores the ceiling and treats the room as one floor plan. Heights and tilts are counted as separate viewing directions.</footer>
+</div>
+
+<script>
+(() => {
+  "use strict";
+  const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  // ---------- theme tokens for canvas drawing ----------
+  let T = {};
+  function readTokens() {
+    const cs = getComputedStyle(document.documentElement);
+    for (const name of ["paper", "sheet", "ink", "muted", "rule", "grid", "tape", "tape-soft",
+      "seen", "partial", "solid", "unseen", "furniture"]) {
+      T[name] = cs.getPropertyValue("--" + name).trim();
+    }
+    T.mono = cs.getPropertyValue("--mono").trim();
+    T.body = cs.getPropertyValue("--body").trim();
+  }
+  readTokens();
+  window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => { readTokens(); redrawAll(); });
+  new MutationObserver(() => { readTokens(); redrawAll(); })
+    .observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+
+  function fitCanvas(canvas) {
+    const rect = canvas.getBoundingClientRect();
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const w = Math.max(1, Math.round(rect.width * dpr));
+    const h = Math.max(1, Math.round(rect.height * dpr));
+    if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+    return { w, h, dpr };
+  }
+
+  // ---------- parallax demo ----------
+  const panCanvas = document.getElementById("pan");
+  const walkCanvas = document.getElementById("walk");
+  const farDots = [];
+  for (let i = 0; i < 26; i++) farDots.push({ x: (i * 0.137) % 1.6 - 0.3, y: 0.18 + ((i * 0.29) % 0.42), r: 0.012 + (i % 3) * 0.006 });
+
+  function drawParallax(canvas, mode, phase) {
+    const { w, h, dpr } = fitCanvas(canvas);
+    const c = canvas.getContext("2d");
+    c.fillStyle = T.sheet; c.fillRect(0, 0, w, h);
+    const swing = Math.sin(phase);              // -1..1
+    const far = mode === "pan" ? swing * 0.16 : swing * 0.035;
+    const near = swing * 0.16;
+    // far wall: posters / dots
+    c.fillStyle = T.rule;
+    for (const d of farDots) {
+      c.beginPath();
+      c.arc((d.x - far) * w, d.y * h, d.r * w, 0, Math.PI * 2);
+      c.fill();
+    }
+    c.fillStyle = T.grid; c.fillRect(0, h * 0.74, w, h * 0.26);
+    c.strokeStyle = T.rule; c.lineWidth = dpr; c.beginPath(); c.moveTo(0, h * 0.74); c.lineTo(w, h * 0.74); c.stroke();
+    // near plant
+    const px = (0.5 - near) * w;
+    c.fillStyle = T.ink;
+    c.fillRect(px - 0.035 * w, h * 0.62, 0.07 * w, h * 0.3);
+    c.fillStyle = T.solid;
+    for (let k = 0; k < 5; k++) {
+      c.beginPath();
+      c.ellipse(px + Math.cos(k * 1.3) * 0.05 * w, h * (0.42 + (k % 3) * 0.07), 0.06 * w, 0.035 * w, k * 0.6, 0, Math.PI * 2);
+      c.fill();
+    }
+    // motion arrows (readable even when still)
+    const arrow = (y, len, color, text) => {
+      const x0 = w * 0.08, x1 = x0 + len * w;
+      c.strokeStyle = color; c.fillStyle = color; c.lineWidth = 2.5 * dpr;
+      c.beginPath(); c.moveTo(x0, y); c.lineTo(x1, y); c.stroke();
+      c.beginPath(); c.moveTo(x1, y); c.lineTo(x1 - 8 * dpr, y - 5 * dpr); c.lineTo(x1 - 8 * dpr, y + 5 * dpr); c.closePath(); c.fill();
+      c.font = `${12 * dpr}px ${T.mono}`; c.fillText(text, x1 + 8 * dpr, y + 4 * dpr);
+    };
+    arrow(h * 0.08, mode === "pan" ? 0.32 : 0.07, T.muted, "far wall moves");
+    arrow(h * 0.16, 0.32, T.tape, "near plant moves");
+  }
+
+  // ---------- room model ----------
+  const ROOM = { w: 7, h: 5 };
+  const BOXES = [
+    { name: "Shelf", x: 0, y: 1.2, w: 0.4, h: 1.8 },
+    { name: "Island", x: 4.6, y: 1.4, w: 0.8, h: 1.6 },
+    { name: "Table", x: 2.9, y: 3.2, w: 1.2, h: 0.55 },
+    { name: "Sofa", x: 2.4, y: 4.3, w: 2.4, h: 0.7 },
+  ];
+  const SEG = 0.25;
+  const HFOV = 66 * Math.PI / 180;
+  const MAX_DIST = 6.5;
+
+  function insideBox(x, y, pad) {
+    return BOXES.some(b => x > b.x - pad && x < b.x + b.w + pad && y > b.y - pad && y < b.y + b.h + pad);
+  }
+  const segments = [];
+  function addEdge(x0, y0, x1, y1, nx, ny, owner) {
+    const len = Math.hypot(x1 - x0, y1 - y0), n = Math.max(1, Math.round(len / SEG));
+    for (let i = 0; i < n; i++) {
+      const a = i / n, b = (i + 1) / n;
+      const ax = x0 + (x1 - x0) * a, ay = y0 + (y1 - y0) * a, bx = x0 + (x1 - x0) * b, by = y0 + (y1 - y0) * b;
+      const mx = (ax + bx) / 2, my = (ay + by) / 2;
+      if (owner === null && insideBox(mx + nx * 0.05, my + ny * 0.05, 0.02)) continue; // wall hidden behind furniture
+      if (owner !== null && (mx <= 0.001 || my <= 0.001 || mx >= ROOM.w - 0.001 || my >= ROOM.h - 0.001)) continue; // face against a wall
+      segments.push({ ax, ay, bx, by, mx, my, nx, ny, owner, mask: 0 });
+    }
+  }
+  addEdge(0, 0, ROOM.w, 0, 0, 1, null);
+  addEdge(ROOM.w, 0, ROOM.w, ROOM.h, -1, 0, null);
+  addEdge(ROOM.w, ROOM.h, 0, ROOM.h, 0, -1, null);
+  addEdge(0, ROOM.h, 0, 0, 1, 0, null);
+  BOXES.forEach((b, i) => {
+    addEdge(b.x, b.y, b.x + b.w, b.y, 0, -1, i);
+    addEdge(b.x + b.w, b.y, b.x + b.w, b.y + b.h, 1, 0, i);
+    addEdge(b.x + b.w, b.y + b.h, b.x, b.y + b.h, 0, 1, i);
+    addEdge(b.x, b.y + b.h, b.x, b.y, -1, 0, i);
+  });
+
+  function segmentHitsBox(x0, y0, x1, y1, b) {
+    let t0 = 0, t1 = 1;
+    const dx = x1 - x0, dy = y1 - y0;
+    const tests = [[-dx, x0 - b.x], [dx, b.x + b.w - x0], [-dy, y0 - b.y], [dy, b.y + b.h - y0]];
+    for (const [p, q] of tests) {
+      if (Math.abs(p) < 1e-9) { if (q < 0) return false; continue; }
+      const r = q / p;
+      if (p < 0) { if (r > t1) return false; if (r > t0) t0 = r; }
+      else { if (r < t0) return false; if (r < t1) t1 = r; }
+    }
+    return t1 > t0 + 1e-6;
+  }
+
+  // Which coverage bits a camera adds: 5 plan-angle bins x 3 height bands.
+  function observe(cam, onNew) {
+    const heightBand = cam.h < 1.2 ? 0 : cam.h < 1.75 ? 1 : 2;
+    const fl = Math.hypot(cam.fx, cam.fy);
+    const fx = cam.fx / fl, fy = cam.fy / fl;
+    for (const s of segments) {
+      const vx = s.mx - cam.x, vy = s.my - cam.y;
+      const d = Math.hypot(vx, vy);
+      if (d > MAX_DIST || d < 0.2) continue;
+      if (vx * s.nx + vy * s.ny >= -0.05 * d) continue;          // seen from behind or edge-on
+      const cosA = (vx * fx + vy * fy) / d;
+      if (cosA < Math.cos(HFOV / 2)) continue;                     // outside the picture
+      const px = s.mx + s.nx * 0.02, py = s.my + s.ny * 0.02;
+      if (BOXES.some(b => segmentHitsBox(cam.x, cam.y, px, py, b))) continue;
+      // angle of the view relative to the surface normal, -90..90
+      const ox = -vx / d, oy = -vy / d;
+      const cross = s.nx * oy - s.ny * ox;
+      const ang = Math.atan2(cross, s.nx * ox + s.ny * oy) * 180 / Math.PI;
+      const bin = Math.min(4, Math.max(0, Math.floor((ang + 90) / 36)));
+      const bit = 1 << (bin * 3 + heightBand);
+      if (!(s.mask & bit)) { s.mask |= bit; if (onNew) onNew(s); }
+    }
+  }
+  const popcount = m => { let c = 0; while (m) { c += m & 1; m >>= 1; } return c; };
+
+  // ---------- paths ----------
+  function makeLoop(points) {
+    const n = points.length, cum = [0];
+    for (let i = 1; i <= n; i++) {
+      const a = points[i - 1], b = points[i % n];
+      cum.push(cum[i - 1] + Math.hypot(b.x - a.x, b.y - a.y));
+    }
+    const L = cum[n];
+    points.forEach((p, i) => {
+      const a = points[(i - 1 + n) % n], b = points[(i + 1) % n];
+      const tx = b.x - a.x, ty = b.y - a.y, tl = Math.hypot(tx, ty) || 1;
+      p.tx = tx / tl; p.ty = ty / tl;
+    });
+    return {
+      L,
+      at(s) {
+        s = ((s % L) + L) % L;
+        let lo = 0, hi = n;
+        while (lo < hi) { const mid = (lo + hi) >> 1; if (cum[mid + 1] <= s) lo = mid + 1; else hi = mid; }
+        return points[Math.min(lo, n - 1)];
+      },
+    };
+  }
+  function roundedRect(x0, y0, x1, y1, r) {
+    const pts = [], step = 0.01;
+    const add = (x, y, nx, ny) => pts.push({ x, y, nx, ny });
+    const arc = (cx, cy, a0) => {
+      for (let s = 0; s < Math.PI / 2 * r; s += step) {
+        const a = a0 + s / r, px = cx + r * Math.cos(a), py = cy + r * Math.sin(a);
+        add(px, py, (cx - px) / r, (cy - py) / r);
+      }
+    };
+    for (let s = 0; s < x1 - x0 - 2 * r; s += step) add(x0 + r + s, y0, 0, 1);
+    arc(x1 - r, y0 + r, -Math.PI / 2);
+    for (let s = 0; s < y1 - y0 - 2 * r; s += step) add(x1, y0 + r + s, -1, 0);
+    arc(x1 - r, y1 - r, 0);
+    for (let s = 0; s < x1 - x0 - 2 * r; s += step) add(x1 - r - s, y1, 0, -1);
+    arc(x0 + r, y1 - r, Math.PI / 2);
+    for (let s = 0; s < y1 - y0 - 2 * r; s += step) add(x0, y1 - r - s, 1, 0);
+    arc(x0 + r, y0 + r, Math.PI);
+    return makeLoop(pts);
+  }
+  function ellipse(cx, cy, rx, ry, t0, inward) {
+    const pts = [];
+    for (let i = 0; i < 1600; i++) {
+      const t = t0 + i / 1600 * Math.PI * 2;
+      const x = cx + rx * Math.cos(t), y = cy + ry * Math.sin(t);
+      let nx = Math.cos(t) / rx, ny = Math.sin(t) / ry; const nl = Math.hypot(nx, ny);
+      nx /= nl; ny /= nl;
+      if (inward) { nx = -nx; ny = -ny; }
+      pts.push({ x, y, nx, ny });
+    }
+    return makeLoop(pts);
+  }
+
+  const perimeter = roundedRect(0.9, 0.9, ROOM.w - 0.9, ROOM.h - 0.9, 0.7);
+  const centre = ellipse(3.0, 2.3, 1.3, 0.7, Math.PI / 2, false);   // starts at its bottom point
+  const orbit = ellipse(5.0, 2.2, 1.05, 1.05, Math.PI, true);       // starts at its left point
+  const OVERLAP = 1.2;
+
+  function walk(loop, s0, len, dir, offsetDeg, h, tilt, step = 0.05) {
+    const out = [], o = offsetDeg * Math.PI / 180;
+    for (let d = 0; d <= len; d += step) {
+      const p = loop.at(s0 + dir * d);
+      const tx = p.tx * dir, ty = p.ty * dir;
+      out.push({ x: p.x, y: p.y, fx: p.nx * Math.cos(o) + tx * Math.sin(o), fy: p.ny * Math.cos(o) + ty * Math.sin(o), h, tilt });
+    }
+    return out;
+  }
+  function join(pieces) {
+    const out = [];
+    for (let piece of pieces) {
+      if (out.length) {
+        const a = out[out.length - 1], b = piece[0];
+        const dist = Math.hypot(b.x - a.x, b.y - a.y);
+        if (dist > 0.3) {
+          const n = Math.ceil(dist / 0.05);
+          const a0 = Math.atan2(a.fy, a.fx), a1 = Math.atan2(b.fy, b.fx);
+          let da = a1 - a0; while (da > Math.PI) da -= 2 * Math.PI; while (da < -Math.PI) da += 2 * Math.PI;
+          for (let i = 1; i < n; i++) {
+            const t = i / n, ang = a0 + da * t;
+            out.push({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t, fx: Math.cos(ang), fy: Math.sin(ang),
+              h: a.h + (b.h - a.h) * t, tilt: a.tilt + (b.tilt - a.tilt) * t, link: true });
+          }
+        } else {
+          // change height while walking the first stretch of the next pass
+          const ramp = Math.min(30, piece.length);
+          piece = piece.map((p, i) => i < ramp ? { ...p, h: a.h + (p.h - a.h) * (i / ramp), tilt: a.tilt + (p.tilt - a.tilt) * (i / ramp) } : p);
+        }
+      }
+      out.push(...piece);
+    }
+    return out;
+  }
+
+  const L = perimeter.L;
+  const PASSES = [
+    { key: "Pass 1", title: "Eye-level lap", path: walk(perimeter, 0, L + OVERLAP, 1, 0, 1.5, 0),
+      height: "Chest to eye level, about 1.5 m.", tilt: "Level.",
+      facing: "Straight across the room at the opposite wall. Side-step (crab-walk) along the wall.",
+      where: "About 1 m off the walls, all the way round, then a metre past where you started.",
+      catches: "Every wall head-on and the fronts of furniture. Sets up the frame everything else joins to." },
+    { key: "Pass 2", title: "High lap", path: walk(perimeter, OVERLAP, L + OVERLAP, 1, 35, 1.95, -35),
+      height: "Arm raised, about 1.9 m.", tilt: "Down 30–40°.",
+      facing: "Across the room, turned about 35° toward where you're walking.",
+      where: "Same route as lap 1, same direction. Raise the phone while walking the first metre.",
+      catches: "Floor, table and counter tops, and a second angle on every wall." },
+    { key: "Pass 3", title: "Low lap, reversed", path: walk(perimeter, 2 * OVERLAP, L + OVERLAP, -1, 35, 0.9, 20),
+      height: "Waist height, about 0.9 m.", tilt: "Up 15–20°.",
+      facing: "Across the room, about 35° toward the new walking direction (the mirror of lap 2).",
+      where: "Same route, walking the other way round. Lower the phone while you turn back.",
+      catches: "Sides of furniture, under the table, the wall–ceiling join, and a third angle on every wall." },
+    { key: "Pass 4", title: "Centre, looking out", path: walk(centre, 0, centre.L * 1.75, 1, 0, 1.5, -5),
+      height: "About 1.5 m.", tilt: "Level.",
+      facing: "Outward, at the walls, while you walk a small loop in the middle.",
+      where: "Walk in from the edge facing the way you'll look, loop the middle once, then continue to the next object.",
+      catches: "Walls from the middle of the room, and everything the edge laps saw only from one side." },
+    { key: "Pass 5", title: "Detail orbits",
+      path: join([walk(orbit, 0, orbit.L, 1, 0, 1.6, -30), walk(orbit, orbit.L, orbit.L + 0.6, 1, 0, 1.0, -10)]),
+      height: "1.6 m for the first loop, then 1.0 m.", tilt: "Down 30°, then 10°.",
+      facing: "The object, kept centred the whole time. Move your body, not your wrist.",
+      where: "About 1 m from the object, all the way round, twice.",
+      catches: "The objects people will look at closely, from every side." },
+  ];
+  const FULL = {
+    key: "Full take", title: "All five passes, back to back", path: join(PASSES.map(p => p.path)),
+    height: "Changes while walking: 1.5 → 1.9 → 0.9 → 1.5 → 1.6 → 1.0 m.", tilt: "Follows each pass.",
+    facing: "Across the room on the laps, outward in the middle, at the object on the orbits.",
+    where: "One continuous video. Never stand still to turn or to change height.",
+    catches: "The whole room from three or more directions. Most surfaces end up green.",
+  };
+  const PACE = 0.35; // metres per second
+  const pathLength = path => path.reduce((sum, p, i) => i ? sum + Math.hypot(p.x - path[i - 1].x, p.y - path[i - 1].y) : 0, 0);
+
+  // ---------- simulator state ----------
+  const plan = document.getElementById("plan");
+  const elev = document.getElementById("elev");
+  let current = FULL, currentIndex = "full";
+  let cursor = 0, playing = false, speeds = [4, 8, 16], speedIdx = 1, cumulative = true;
+  let splashes = [], lastTime = 0, walked = 0;
+
+  function resetCoverage(includeEarlier) {
+    segments.forEach(s => { s.mask = 0; });
+    if (includeEarlier && currentIndex !== "full") {
+      for (let i = 0; i < currentIndex; i++) PASSES[i].path.forEach(p => observe(p));
+    }
+  }
+  function select(index) {
+    currentIndex = index;
+    current = index === "full" ? FULL : PASSES[index];
+    document.querySelectorAll(".tabs button").forEach(b => b.setAttribute("aria-pressed", String(b.dataset.pass === String(index))));
+    document.getElementById("p-kicker").textContent = current.key;
+    document.getElementById("p-title").textContent = current.title;
+    for (const f of ["height", "tilt", "facing", "where", "catches"]) document.getElementById("p-" + f).textContent = current[f];
+    restart();
+  }
+  function restart() {
+    cursor = 0; walked = 0; splashes = [];
+    resetCoverage(cumulative);
+    if (reduceMotion && !playing) { finishInstantly(); }
+    redrawAll();
+  }
+  function finishInstantly() {
+    current.path.forEach((p, i) => { observe(p); if (i) walked += Math.hypot(p.x - current.path[i - 1].x, p.y - current.path[i - 1].y); });
+    cursor = current.path.length - 1;
+  }
+
+  function stepTo(target, now) {
+    while (cursor < target && cursor < current.path.length - 1) {
+      const a = current.path[cursor], b = current.path[cursor + 1];
+      walked += Math.hypot(b.x - a.x, b.y - a.y);
+      cursor++;
+      observe(b, s => splashes.push({ x: s.mx, y: s.my, t0: now, mask: s.mask }));
+    }
+    if (splashes.length > 160) splashes = splashes.slice(-160);
+  }
+
+  function loop(now) {
+    if (!playing) return;
+    const dt = Math.min(0.1, (now - lastTime) / 1000); lastTime = now;
+    const metres = dt * PACE * speeds[speedIdx];
+    stepTo(cursor + Math.max(1, Math.round(metres / 0.05)), now);
+    if (cursor >= current.path.length - 1) {
+      setPlaying(false);
+    }
+    redrawAll(now);
+    if (playing) requestAnimationFrame(loop);
+  }
+  function setPlaying(on) {
+    playing = on;
+    const btn = document.getElementById("play");
+    btn.textContent = on ? "Pause" : (cursor >= current.path.length - 1 ? "Play again" : "Play");
+    btn.setAttribute("aria-pressed", String(on));
+    if (on) {
+      if (cursor >= current.path.length - 1) restartKeepingPlay();
+      lastTime = performance.now();
+      requestAnimationFrame(loop);
+    }
+  }
+  function restartKeepingPlay() { cursor = 0; walked = 0; splashes = []; resetCoverage(cumulative); }
+
+  function coverageColor(mask) {
+    const n = popcount(mask);
+    return n === 0 ? T.unseen : n === 1 ? T.seen : n === 2 ? T.partial : T.solid;
+  }
+  const fmt = sec => `${Math.floor(sec / 60)}:${String(Math.floor(sec % 60)).padStart(2, "0")}`;
+
+  function drawPlan(now) {
+    const { w, h, dpr } = fitCanvas(plan);
+    const c = plan.getContext("2d");
+    const margin = 0.3;
+    const scale = Math.min(w / (ROOM.w + 2 * margin), h / (ROOM.h + 2 * margin));
+    const ox = (w - ROOM.w * scale) / 2, oy = (h - ROOM.h * scale) / 2;
+    const X = x => ox + x * scale, Y = y => oy + y * scale;
+    c.fillStyle = T.sheet; c.fillRect(0, 0, w, h);
+    // 0.5 m grid
+    c.strokeStyle = T.grid; c.lineWidth = dpr;
+    for (let x = 0; x <= ROOM.w + 1e-6; x += 0.5) { c.beginPath(); c.moveTo(X(x), Y(0)); c.lineTo(X(x), Y(ROOM.h)); c.stroke(); }
+    for (let y = 0; y <= ROOM.h + 1e-6; y += 0.5) { c.beginPath(); c.moveTo(X(0), Y(y)); c.lineTo(X(ROOM.w), Y(y)); c.stroke(); }
+    // scale bar
+    c.fillStyle = T.muted; c.font = `${11 * dpr}px ${T.mono}`;
+    c.fillText("1 m", X(0) + 4 * dpr, Y(ROOM.h) + 18 * dpr);
+    c.strokeStyle = T.muted; c.lineWidth = 2 * dpr;
+    c.beginPath(); c.moveTo(X(0.5), Y(ROOM.h) + 14 * dpr); c.lineTo(X(1.5), Y(ROOM.h) + 14 * dpr); c.stroke();
+    // furniture
+    for (const b of BOXES) {
+      c.fillStyle = T.furniture; c.fillRect(X(b.x), Y(b.y), b.w * scale, b.h * scale);
+      c.fillStyle = T.muted; c.font = `${11 * dpr}px ${T.mono}`;
+      c.fillText(b.name.toUpperCase(), X(b.x) + 4 * dpr, Y(b.y + b.h / 2) + 4 * dpr);
+    }
+    // ghost of the whole route
+    c.strokeStyle = T.rule; c.lineWidth = 1.5 * dpr; c.setLineDash([4 * dpr, 5 * dpr]);
+    c.beginPath();
+    current.path.forEach((p, i) => i ? c.lineTo(X(p.x), Y(p.y)) : c.moveTo(X(p.x), Y(p.y)));
+    c.stroke(); c.setLineDash([]);
+    // walked part
+    c.strokeStyle = T.tape; c.lineWidth = 2 * dpr; c.globalAlpha = 0.55;
+    c.beginPath();
+    for (let i = 0; i <= cursor; i++) { const p = current.path[i]; i ? c.lineTo(X(p.x), Y(p.y)) : c.moveTo(X(p.x), Y(p.y)); }
+    c.stroke(); c.globalAlpha = 1;
+    // surfaces
+    c.lineCap = "butt";
+    for (const s of segments) {
+      const off = 0.06;
+      c.strokeStyle = coverageColor(s.mask);
+      c.lineWidth = (s.mask ? 6 : 4) * dpr;
+      c.beginPath();
+      c.moveTo(X(s.ax + s.nx * off), Y(s.ay + s.ny * off));
+      c.lineTo(X(s.bx + s.nx * off), Y(s.by + s.ny * off));
+      c.stroke();
+    }
+    // splashes
+    if (now) {
+      splashes = splashes.filter(sp => now - sp.t0 < 700);
+      for (const sp of splashes) {
+        const t = (now - sp.t0) / 700;
+        c.strokeStyle = coverageColor(sp.mask); c.globalAlpha = 1 - t; c.lineWidth = 2 * dpr;
+        c.beginPath(); c.arc(X(sp.x), Y(sp.y), (0.08 + 0.32 * t) * scale, 0, Math.PI * 2); c.stroke();
+      }
+      c.globalAlpha = 1;
+    }
+    // camera and its view
+    const cam = current.path[cursor];
+    const ang = Math.atan2(cam.fy, cam.fx), reach = 2.4;
+    c.fillStyle = T["tape-soft"];
+    c.beginPath(); c.moveTo(X(cam.x), Y(cam.y));
+    c.arc(X(cam.x), Y(cam.y), reach * scale, ang - HFOV / 2, ang + HFOV / 2); c.closePath(); c.fill();
+    c.strokeStyle = T.tape; c.lineWidth = 1.5 * dpr;
+    for (const a of [ang - HFOV / 2, ang + HFOV / 2]) {
+      c.beginPath(); c.moveTo(X(cam.x), Y(cam.y)); c.lineTo(X(cam.x + Math.cos(a) * reach), Y(cam.y + Math.sin(a) * reach)); c.stroke();
+    }
+    c.fillStyle = T.tape;
+    c.beginPath(); c.arc(X(cam.x), Y(cam.y), 6 * dpr, 0, Math.PI * 2); c.fill();
+    c.fillStyle = T.paper;
+    c.beginPath(); c.arc(X(cam.x), Y(cam.y), 2.5 * dpr, 0, Math.PI * 2); c.fill();
+    // start marker
+    const s0 = current.path[0];
+    c.strokeStyle = T.ink; c.lineWidth = 1.5 * dpr;
+    c.strokeRect(X(s0.x) - 5 * dpr, Y(s0.y) - 5 * dpr, 10 * dpr, 10 * dpr);
+    c.fillStyle = T.ink; c.font = `600 ${11 * dpr}px ${T.mono}`;
+    c.fillText("START", X(s0.x) + 9 * dpr, Y(s0.y) - 7 * dpr);
+  }
+
+  function drawElevation() {
+    const { w, h, dpr } = fitCanvas(elev);
+    const c = elev.getContext("2d");
+    c.fillStyle = T.sheet; c.fillRect(0, 0, w, h);
+    const cam = current.path[cursor];
+    const floorY = h * 0.88, ceil = 2.6, mpx = (floorY - h * 0.08) / ceil;
+    const Yh = m => floorY - m * mpx;
+    c.strokeStyle = T.rule; c.lineWidth = dpr;
+    c.beginPath(); c.moveTo(0, Yh(ceil)); c.lineTo(w, Yh(ceil)); c.stroke();
+    c.strokeStyle = T.ink; c.lineWidth = 2 * dpr;
+    c.beginPath(); c.moveTo(0, floorY); c.lineTo(w, floorY); c.stroke();
+    c.fillStyle = T.muted; c.font = `${11 * dpr}px ${T.mono}`;
+    c.fillText("ceiling 2.6 m", 8 * dpr, Yh(ceil) + 16 * dpr);
+    // person
+    const px = w * 0.22;
+    c.strokeStyle = T.muted; c.lineWidth = 3 * dpr; c.lineCap = "round";
+    c.beginPath(); c.moveTo(px, floorY); c.lineTo(px, Yh(0.9)); c.lineTo(px, Yh(1.45)); c.stroke();
+    c.beginPath(); c.arc(px, Yh(1.62), 0.13 * mpx, 0, Math.PI * 2); c.stroke();
+    // arm to camera
+    const cx = px + 0.35 * mpx, cy = Yh(cam.h);
+    c.beginPath(); c.moveTo(px, Yh(1.38)); c.lineTo(cx, cy); c.stroke();
+    // view cone (vertical FOV about 40 degrees)
+    const tilt = cam.tilt * Math.PI / 180, vf = 20 * Math.PI / 180, reach = w * 0.7;
+    c.fillStyle = T["tape-soft"];
+    c.beginPath(); c.moveTo(cx, cy);
+    c.lineTo(cx + Math.cos(tilt + vf) * reach, cy - Math.sin(tilt + vf) * reach);
+    c.lineTo(cx + Math.cos(tilt - vf) * reach, cy - Math.sin(tilt - vf) * reach);
+    c.closePath(); c.fill();
+    c.strokeStyle = T.tape; c.lineWidth = 2 * dpr;
+    c.beginPath(); c.moveTo(cx, cy); c.lineTo(cx + Math.cos(tilt) * reach * 0.8, cy - Math.sin(tilt) * reach * 0.8); c.stroke();
+    c.fillStyle = T.tape; c.beginPath(); c.arc(cx, cy, 5 * dpr, 0, Math.PI * 2); c.fill();
+    c.fillStyle = T.ink; c.font = `600 ${12 * dpr}px ${T.mono}`;
+    const tiltText = Math.abs(cam.tilt) < 2 ? "level" : cam.tilt > 0 ? `up ${Math.round(cam.tilt)}°` : `down ${Math.round(-cam.tilt)}°`;
+    c.fillText(`${cam.h.toFixed(2)} m · ${tiltText}`, w - 170 * dpr, h * 0.16);
+  }
+
+  function updateStats() {
+    const counted = segments.length;
+    const solid = segments.filter(s => popcount(s.mask) >= 3).length;
+    const seen = segments.filter(s => s.mask).length;
+    document.getElementById("s-solid").textContent = Math.round(100 * solid / counted) + "%";
+    document.getElementById("s-seen").textContent = Math.round(100 * seen / counted) + "%";
+    document.getElementById("s-time").textContent = fmt(walked / PACE);
+    document.getElementById("clock").textContent = `${fmt(walked / PACE)} of ${fmt(pathLength(current.path) / PACE)} take`;
+  }
+
+  let parallaxPhase = 0.9;
+  function redrawAll(now) {
+    drawPlan(now);
+    drawElevation();
+    updateStats();
+    drawParallax(panCanvas, "pan", parallaxPhase);
+    drawParallax(walkCanvas, "walk", parallaxPhase);
+  }
+
+  function parallaxLoop(now) {
+    parallaxPhase = now / 900;
+    drawParallax(panCanvas, "pan", parallaxPhase);
+    drawParallax(walkCanvas, "walk", parallaxPhase);
+    requestAnimationFrame(parallaxLoop);
+  }
+
+  // ---------- controls ----------
+  document.querySelectorAll(".tabs button").forEach(b => b.addEventListener("click", () => {
+    const wasPlaying = playing || !reduceMotion;
+    setPlaying(false);
+    select(b.dataset.pass === "full" ? "full" : Number(b.dataset.pass));
+    if (wasPlaying && !reduceMotion) setPlaying(true);
+  }));
+  document.getElementById("play").addEventListener("click", () => setPlaying(!playing));
+  document.getElementById("restart").addEventListener("click", () => {
+    const was = playing; setPlaying(false); restartKeepingPlay(); redrawAll();
+    if (was || !reduceMotion) setPlaying(true);
+  });
+  document.getElementById("speed").addEventListener("click", e => {
+    speedIdx = (speedIdx + 1) % speeds.length;
+    e.currentTarget.textContent = `Speed ${speeds[speedIdx]}×`;
+  });
+  document.getElementById("cumulative").addEventListener("click", e => {
+    cumulative = !cumulative;
+    e.currentTarget.setAttribute("aria-pressed", String(cumulative));
+    e.currentTarget.textContent = `Earlier passes: ${cumulative ? "on" : "off"}`;
+    const was = playing; setPlaying(false); restartKeepingPlay();
+    if (reduceMotion && !was) finishInstantly();
+    redrawAll();
+    if (was) setPlaying(true);
+  });
+  window.addEventListener("resize", () => redrawAll());
+
+  // Checklist ticks are remembered on this device only.
+  document.querySelectorAll("#checklist input").forEach(box => {
+    try { box.checked = localStorage.getItem("walk-dont-pan:" + box.id) === "1"; } catch (e) { /* storage unavailable */ }
+    box.addEventListener("change", () => {
+      try { localStorage.setItem("walk-dont-pan:" + box.id, box.checked ? "1" : "0"); } catch (e) { /* storage unavailable */ }
+    });
+  });
+
+  // ---------- start ----------
+  select("full");
+  if (reduceMotion) {
+    redrawAll();
+  } else {
+    setPlaying(true);
+    requestAnimationFrame(parallaxLoop);
+  }
+  document.fonts && document.fonts.ready.then(() => redrawAll());
+})();
+</script>
+</body>
+</html>
