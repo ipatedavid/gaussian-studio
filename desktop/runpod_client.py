@@ -130,7 +130,7 @@ class RunPodClient:
     def select_gpu_types(
         self, max_price: float, min_vram_gb: int, *,
         cloud_type: str, container_disk_gb: int, volume_gb: int,
-        min_vcpu: int, min_memory_gb: int,
+        min_vcpu: int, min_memory_gb: int, max_vram_gb: int = 0,
     ) -> list[dict]:
         if cloud_type not in {"ALL", "COMMUNITY", "SECURE"}:
             raise RunPodError(f"Unsupported cloud type: {cloud_type}")
@@ -141,7 +141,7 @@ class RunPodClient:
         )
         for gpu in gpu_types:
             memory = self._to_float(gpu.get("memoryInGb")) or 0
-            if memory < min_vram_gb:
+            if memory < min_vram_gb or (max_vram_gb and memory > max_vram_gb):
                 continue
             for tier, flag, list_key, offer_key in (
                 ("COMMUNITY", "communityCloud", "communityPrice", "communityOffer"),

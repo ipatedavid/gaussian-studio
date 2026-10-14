@@ -13,13 +13,13 @@ from pathlib import Path
 from PySide6 import QtCore
 
 from config import (
-    ENGINE_LABELS, ENGINES, GUIDANCE_LABELS, MATCHER_LABELS, QUALITY_LEVELS, AppConfig,
-    quality_steps,
+    DEPTH_GUIDANCE, ENGINE_LABELS, ENGINES, GUIDANCE_LABELS, MATCHER_LABELS, QUALITY_LEVELS,
+    AppConfig, quality_steps,
 )
 from runpod_client import PodCreationUncertainError, RunPodCapacityError, RunPodClient, RunPodError
 from drive_client import DriveClient
 from gpu_speed import duration_text
-from scp_client import ScpClient
+from scp_client import ConnectionLostError, ScpClient
 from pod_ledger import PodLedger
 from storage import (
     DEFAULT_VIDEO_FPS, folder_photos, plan_drive_input, plan_drive_mixed, plan_drive_video,
@@ -33,6 +33,8 @@ PREVIEW_START_TIMEOUT = 900
 # A job script that is alive but leaves the result missing this long after the
 # trainer stopped is treated as stuck; the app then finishes the job itself.
 STUCK_JOB_SECONDS = 120
+REJOIN_ATTEMPTS = 8  # with REJOIN_WAIT_SECONDS: about four minutes to get the pod back
+REJOIN_WAIT_SECONDS = 30
 
 
 def viewer_responds(url: str) -> bool:
@@ -106,6 +108,9 @@ class JobController(QtCore.QObject):
         self.started_at: float | None = None
         self.finished_at: float | None = None
         self.outcome: str | None = None   # "finished", "failed" or "stopped"
+        # Your own 1-5 score of the result and a short note, for comparing runs.
+        self.rating: int | None = None
+        self.rating_note = ""
         self.status_text = "Waiting to start"
         self.results_dir: Path | None = None
         # Shown in the job list and kept in the job history.
@@ -724,7 +729,7 @@ class JobController(QtCore.QObject):
                     f"Spirula options: floater suppression {self.config.spirula_floaters}; "
                     f"AI geometry guidance {GUIDANCE_LABELS[self.config.spirula_guidance]}"
                     + (f" (depth strength {self.config.spirula_depth_weight:g})"
-                       if self.config.spirula_guidance == "depth" else "")
+                       if self.config.spirula_guidance in DEPTH_GUIDANCE else "")
                     + (f"; ignore moving things {self.config.spirula_distraction}"
                        if self.config.spirula_distraction != "off" else "")
                     + "."
@@ -802,6 +807,7 @@ class JobController(QtCore.QObject):
                 container_disk_gb=self.config.container_disk_gb,
                 volume_gb=volume_gb,
                 min_vcpu=self.config.min_vcpu,
+                max_vram_gb=self.config.max_gpu_vram_gb,
                 min_memory_gb=self.config.min_memory_gb,
             )
             candidate = next((item for item in candidates
@@ -960,29 +966,34 @@ class JobController(QtCore.QObject):
             self._on_pod = True
             self.status_changed.emit("Processing images...")
             try:
-                transfer.run_pipeline(
-                    self.config.pipeline_max_steps, self.config.pipeline_num_downscales,
-                    self._pipeline_log(transfer),
-                    source_type=plan.pipeline_source_type,
-                    video_fps=plan.extract_fps or DEFAULT_VIDEO_FPS,
-                    engine=engine, spirula_version=spirula_version,
-                    spirula_floaters=self.config.spirula_floaters,
-                    spirula_distraction=self.config.spirula_distraction,
-                    spirula_guidance=self.config.spirula_guidance,
-                    spirula_depth_weight=self.config.spirula_depth_weight,
-                    preview=self.config.live_preview,
-                    spirula_primitive=self.config.spirula_primitive,
-                    spirula_quality=self.config.spirula_quality,
-                    spirula_vignetting=self.config.spirula_vignetting,
-                    spirula_object=self.config.spirula_object,
-                    spirula_turntable=self.config.spirula_turntable,
-                    spirula_main_scene=self.config.spirula_main_scene,
-                    spirula_matcher=self.config.spirula_matcher,
-                    steps_override=self.config.steps_override,
-                    fisheye=self.config.fisheye_lens,
-                    fisheye_focal_mm=self.config.fisheye_focal_mm,
-                    sensor_width_mm=self.config.sensor_width_mm,
-                )
+                try:
+                    transfer.run_pipeline(
+                        self.config.pipeline_max_steps, self.config.pipeline_num_downscales,
+                        self._pipeline_log(transfer),
+                        source_type=plan.pipeline_source_type,
+                        video_fps=plan.extract_fps or DEFAULT_VIDEO_FPS,
+                        engine=engine, spirula_version=spirula_version,
+                        spirula_floaters=self.config.spirula_floaters,
+                        spirula_distraction=self.config.spirula_distraction,
+                        spirula_guidance=self.config.spirula_guidance,
+                        spirula_depth_weight=self.config.spirula_depth_weight,
+                        preview=self.config.live_preview,
+                        spirula_primitive=self.config.spirula_primitive,
+                        spirula_quality=self.config.spirula_quality,
+                        spirula_vignetting=self.config.spirula_vignetting,
+                        spirula_object=self.config.spirula_object,
+                        spirula_turntable=self.config.spirula_turntable,
+                        spirula_main_scene=self.config.spirula_main_scene,
+                        spirula_matcher=self.config.spirula_matcher,
+                        steps_override=self.config.steps_override,
+                        fisheye=self.config.fisheye_lens,
+                        fisheye_focal_mm=self.config.fisheye_focal_mm,
+                        sensor_width_mm=self.config.sensor_width_mm,
+                    )
+                except ConnectionLostError as exc:
+                    if self._stop_requested.is_set():
+                        raise
+                    self._rejoin_job(transfer, engine, exc)
             except BaseException:
                 self._stop_preview("Processing stopped, so the live preview closed.")
                 raise
@@ -1076,31 +1087,7 @@ class JobController(QtCore.QObject):
                 threading.Thread(target=self._run_preview, args=(transfer,), daemon=True).start()
             self.status_changed.emit("Processing images (reconnected)...")
             self._on_pod = True
-            live_log, stop_log = threading.Event(), self._stop_log
-            if transfer.has_job_log():
-                self.log_line.emit(
-                    "Following the pod's output again, starting with the last lines it printed."
-                )
-                live_log.set()
-
-                def follow_log():
-                    try:
-                        transfer.follow_job_log(self.log_line.emit, stop_log)
-                    except Exception:
-                        pass  # the checkpoint lines take over
-                    finally:
-                        live_log.clear()
-
-                threading.Thread(target=follow_log, daemon=True).start()
-            else:
-                self.log_line.emit(
-                    "This job's pod keeps no copy of what it printed while the app was closed; "
-                    "progress below comes from its training checkpoints."
-                )
-            try:
-                self._follow_remote_job(transfer, engine, live_log)
-            finally:
-                stop_log.set()
+            self._follow_with_log(transfer, engine)
             self._stop_preview("Training finished. The result is downloading to this computer.")
             results_dir = Path(entry["results_dir"]) if entry.get("results_dir") else (
                 results_root / safe_dir_name(Path(self.title).stem)
@@ -1121,6 +1108,65 @@ class JobController(QtCore.QObject):
             skip_termination = self._report_failure(exc)
         finally:
             self._wrap_up(pod_id, client, preserve_pod, skip_termination, success)
+
+    def _follow_with_log(self, transfer, engine: str) -> None:
+        """Follow a job the app is no longer attached to, showing the pod's own output."""
+        live_log, stop_log = threading.Event(), self._stop_log
+        if transfer.has_job_log():
+            self.log_line.emit(
+                "Following the pod's output again, starting with the last lines it printed."
+            )
+            live_log.set()
+
+            def follow_log():
+                try:
+                    transfer.follow_job_log(self.log_line.emit, stop_log)
+                except Exception:
+                    pass  # the checkpoint lines take over
+                finally:
+                    live_log.clear()
+
+            threading.Thread(target=follow_log, daemon=True).start()
+        else:
+            self.log_line.emit(
+                "This job's pod keeps no copy of what it printed while the app was closed; "
+                "progress below comes from its training checkpoints."
+            )
+        try:
+            self._follow_remote_job(transfer, engine, live_log)
+        finally:
+            stop_log.set()
+
+    def _rejoin_job(self, transfer, engine: str, lost: ConnectionLostError) -> None:
+        """The SSH session running the job dropped; the job outlives it, so follow it again.
+
+        Raises the original error when the pod can't be reached or the job is gone.
+        """
+        self.log_line.emit(
+            "The connection to the pod dropped while the job was running. "
+            "The job keeps running on the pod; reconnecting..."
+        )
+        self.status_changed.emit("Reconnecting to the pod...")
+        state = None
+        for attempt in range(REJOIN_ATTEMPTS):
+            try:
+                state = transfer.remote_job_state()
+                break
+            except Exception as exc:
+                self.log_line.emit(
+                    f"Pod not reachable yet ({exc}); attempt {attempt + 1} of {REJOIN_ATTEMPTS}."
+                )
+                if self._stop_requested.wait(REJOIN_WAIT_SECONDS):
+                    raise JobCancelledError("Stop requested from the app.")
+        if state is None:
+            raise lost
+        done = state.get("ply_ready") and state.get("summary_ready")
+        if not (state.get("job_running") or state.get("trainer_running") or done):
+            self.log_line.emit("The pod's job is no longer running and left no result.")
+            raise lost
+        self.log_line.emit("Reconnected; the job is still going.")
+        self.status_changed.emit("Processing images (reconnected)...")
+        self._follow_with_log(transfer, engine)
 
     def _follow_remote_job(self, transfer, engine: str,
                            live_log: threading.Event | None = None) -> None:

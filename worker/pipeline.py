@@ -23,6 +23,11 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
+try:  # guidance levels kept out of the public repo
+    import extra_guidance
+except ImportError:
+    extra_guidance = None
+
 
 JOB_ROOT = Path("/workspace/job")
 INPUT_DIR = JOB_ROOT / "input"
@@ -96,8 +101,11 @@ BIREFNET_BYTES = 444_473_596
 BIREFNET_CACHE = Path.home() / ".cache" / "spirula-studio" / "models" / "birefnet-general.safetensors"
 # The image types `spirula sam track` reads, in the order it numbers them.
 SAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".exr", ".tif", ".tiff"}
-# AI geometry guidance: off | surfaces (normal maps) | depth (normal + depth maps).
+# AI geometry guidance: off | surfaces (normal maps) | depth (normal + depth maps),
+# plus any levels extra_guidance.py adds when it is present.
 SPIRULA_GUIDANCE = os.getenv("PIPELINE_SPIRULA_GUIDANCE", "off")
+GUIDANCE_LEVELS = ("off", "surfaces", "depth", *(extra_guidance.LEVELS if extra_guidance else ()))
+DEPTH_GUIDANCE = ("depth", *(extra_guidance.DEPTH_LEVELS if extra_guidance else ()))
 SPIRULA_DEPTH_WEIGHT = float(os.getenv("PIPELINE_SPIRULA_DEPTH_WEIGHT", "0.05"))
 # Live training preview: both engines serve a web viewer on this pod port. The
 # app reaches it through an SSH tunnel; nothing is exposed publicly.
@@ -154,6 +162,11 @@ SENSOR_WIDTH_MM = float(os.getenv("PIPELINE_SENSOR_WIDTH_MM", "23.5"))
 # "one surface per pixel"; applied whenever guidance maps exist.
 SPIRULA_DISTORTION_REG = "0.01"
 SPIRULA_RUN_NAME = "run"
+# Training that fails this soon after starting with maps kept from a crashed
+# geometry step is retried without them.
+SALVAGED_GUIDANCE_GRACE = 15 * 60
+# How a process killed by a segmentation fault reports through subprocess.
+SEGFAULT_EXIT = -signal.SIGSEGV
 NVIDIA_VULKAN_HOME = Path("/workspace/nvidia-vulkan")
 NVIDIA_SCRATCH_DIR = "/root"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff", ".bmp"}
@@ -234,7 +247,7 @@ def run_command(
     cwd: Path | None = None,
     ok_exit_codes: tuple[int, ...] = (0,),
     env: dict[str, str] | None = None,
-) -> None:
+) -> int:
     printable = " ".join(_quote(arg) for arg in args)
     print(f"[cmd] {printable}", flush=True)
 
@@ -292,6 +305,68 @@ def run_command(
         raise RuntimeError(
             f"Command failed with exit code {exit_code}: {printable}"
         )
+    return exit_code
+
+
+class _VramMonitor:
+    """Samples GPU memory during training; logs it now and then and keeps the peak."""
+
+    SAMPLE_SECONDS = 5
+    LOG_SECONDS = 300
+
+    def __init__(self) -> None:
+        self.peak_mib = 0
+        self.total_mib = 0
+        self.busy: list[int] = []
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def _sample(self) -> tuple[int, int, int] | None:
+        try:
+            out = subprocess.run(
+                ["nvidia-smi", "--query-gpu=memory.used,memory.total,utilization.gpu",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=10, check=False,
+            ).stdout.splitlines()
+            used, total, util = (int(value) for value in out[0].split(","))
+        except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+            return None
+        return used, total, util
+
+    def _run(self) -> None:
+        last_log = time.monotonic()
+        while not self._stop.wait(self.SAMPLE_SECONDS):
+            sample = self._sample()
+            if not sample:
+                continue
+            used, self.total_mib, util = sample
+            self.peak_mib = max(self.peak_mib, used)
+            self.busy.append(util)
+            if time.monotonic() - last_log >= self.LOG_SECONDS:
+                print(f"[vram] {used / 1024:.1f} / {self.total_mib / 1024:.1f} GiB in use, "
+                      f"peak {self.peak_mib / 1024:.1f} GiB, GPU {util}% busy", flush=True)
+                last_log = time.monotonic()
+
+    def __enter__(self) -> "_VramMonitor":
+        if shutil.which("nvidia-smi"):
+            self._thread.start()
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join()
+        if self.peak_mib:
+            print(f"[vram] training peak: {self.peak_mib / 1024:.1f} of "
+                  f"{self.total_mib / 1024:.1f} GiB ({self.peak_mib / self.total_mib:.0%}); "
+                  f"GPU busy {sum(self.busy) / len(self.busy):.0f}% on average", flush=True)
+
+    def summary(self) -> dict | None:
+        if not self.peak_mib:
+            return None
+        return {"peak_gib": round(self.peak_mib / 1024, 2),
+                "total_gib": round(self.total_mib / 1024, 2),
+                "average_gpu_busy_percent": round(sum(self.busy) / len(self.busy))}
 
 
 def _quote(value: str) -> str:
@@ -766,6 +841,37 @@ def _read_sparse(model: Path):
     return cameras, points
 
 
+def _capture_stats(dataset: Path, images_dir: Path, image_count: int, registered: int) -> dict:
+    """How well the photos were solved, for comparing runs later. Printed as a [stats] line."""
+    stats: dict = {"images": image_count, "registered": registered}
+    first = next((path for path in sorted(images_dir.rglob("*"))
+                  if path.suffix.lower() in IMAGE_EXTENSIONS), None)
+    size = _image_size(first) if first else None
+    if size:
+        stats["width"], stats["height"] = size
+    model = _largest_model(dataset)
+    if model and (model / "points3D.bin").is_file():
+        errors, tracks = 0.0, 0
+        try:
+            with (model / "points3D.bin").open("rb") as handle:
+                (count,) = struct.unpack("<Q", handle.read(8))
+                for _ in range(count):
+                    _, _, _, _, _, _, _, error, track = struct.unpack("<Q3d3BdQ", handle.read(51))
+                    handle.seek(track * 8, 1)
+                    errors += error
+                    tracks += track
+        except (OSError, struct.error):
+            count = 0
+        if count:
+            stats["sparse_points"] = count
+            stats["mean_track_length"] = round(tracks / count, 2)
+            # Spirula leaves the per-point error at 0 and prints its own mean instead.
+            if errors > 0:
+                stats["reprojection_error_px"] = round(errors / count, 3)
+    print(f"[stats] capture {json.dumps(stats)}", flush=True)
+    return stats
+
+
 def _norm(v):
     length = sum(c * c for c in v) ** 0.5
     return tuple(c / length for c in v) if length > 0 else v
@@ -939,6 +1045,8 @@ def _video_timing(video: Path) -> tuple[float, float]:
 
 
 SPIRULA_RESULT: dict = {}
+# Peak GPU memory during training, filled by _VramMonitor.
+TRAINING_VRAM: dict = {}
 
 
 def _image_size(path: Path) -> tuple[int, int] | None:
@@ -1011,11 +1119,20 @@ def _fisheye_sfm_args(images_dir: Path, groups: list[str] = ()) -> list[str]:
     return args
 
 
-def _spirula_geometry(spirula: Path, dataset: Path) -> str:
+def _map_count(folder: Path) -> int:
+    """Non-empty files under a guidance folder (no particular map format assumed)."""
+    if not folder.is_dir():
+        return 0
+    return sum(1 for path in folder.rglob("*") if path.is_file() and path.stat().st_size > 0)
+
+
+def _spirula_geometry(spirula: Path, dataset: Path, frames: int) -> str:
     """Estimate per-frame surface directions (and depth) with Spirula's AI models.
 
     Returns the guidance level that is actually in place. A failure here is not
     fatal: training continues without guidance and the summary says so.
+    Spirula 2026.9.30 crashes (exit -11) on its way out after writing every map;
+    complete maps are kept then, and training retries without them if they fail it.
     """
     with_depth = SPIRULA_GUIDANCE == "depth"
     print(
@@ -1031,6 +1148,19 @@ def _spirula_geometry(spirula: Path, dataset: Path) -> str:
             cwd=JOB_ROOT,
         )
     except RuntimeError as exc:
+        normals = _map_count(dataset / "normals")
+        if frames and normals >= frames:
+            depths_complete = with_depth and _map_count(dataset / "depths") >= frames
+            if not depths_complete:
+                shutil.rmtree(dataset / "depths", ignore_errors=True)
+            SPIRULA_RESULT["guidance_salvaged"] = True
+            kept = "depth" if depths_complete else "surfaces"
+            print(
+                f"[pipeline] geometry step crashed after writing all {normals} normal maps "
+                f"({exc}); keeping them (guidance: {kept})",
+                flush=True,
+            )
+            return kept
         for name in ("normals", "depths"):
             shutil.rmtree(dataset / name, ignore_errors=True)
         print(
@@ -1039,8 +1169,8 @@ def _spirula_geometry(spirula: Path, dataset: Path) -> str:
             flush=True,
         )
         return "off"
-    normals = _count_images(dataset / "normals")
-    depths = _count_images(dataset / "depths")
+    normals = _map_count(dataset / "normals")
+    depths = _map_count(dataset / "depths")
     print(
         f"[pipeline] geometry guidance ready in {time.time() - started:.0f}s: "
         f"{normals} normal maps" + (f", {depths} depth maps" if with_depth else ""),
@@ -1054,7 +1184,7 @@ def _spirula_geometry(spirula: Path, dataset: Path) -> str:
         print("[pipeline] WARNING: no depth maps were written; using surface guidance only.",
               flush=True)
         return "surfaces"
-    return SPIRULA_GUIDANCE
+    return "depth" if with_depth else "surfaces"
 
 
 def _spirula_model_dir() -> Path:
@@ -1253,8 +1383,11 @@ def _run_spirula(videos: list[Path]) -> tuple[int, int, Path, float]:
     print(f"[pipeline] feature matching: {SFM_MATCHER_LABELS[SPIRULA_MATCHER]}", flush=True)
 
     # Exit code 3 means "reconstructed but partial"; the registered-fraction
-    # check below decides whether that is good enough.
-    run_command(
+    # check below decides whether that is good enough. Spirula 2026.9.30 also
+    # segfaults on its way out (-11) after any AI matcher (ALIKED + LightGlue,
+    # LoMa), once the model is written; a model from this run is kept then.
+    sfm_started = time.time()
+    sfm_exit = run_command(
         [
             str(spirula), "sfm", "auto", str(images_dir), "-o", str(dataset),
             "--data-type", data_type,
@@ -1264,8 +1397,18 @@ def _run_spirula(videos: list[Path]) -> tuple[int, int, Path, float]:
                else _fisheye_sfm_args(images_dir)) if FISHEYE else []),
         ],
         cwd=JOB_ROOT,
-        ok_exit_codes=(0, 3),
+        ok_exit_codes=(0, 3, SEGFAULT_EXIT),
     )
+    if sfm_exit == SEGFAULT_EXIT:
+        written = [model / "images.bin" for model in (dataset / "sparse").glob("*")
+                   if (model / "images.bin").is_file()
+                   and (model / "images.bin").stat().st_mtime >= sfm_started]
+        if not written:
+            raise RuntimeError(
+                "Spirula SfM crashed (exit code -11) before writing a camera model.")
+        print("[pipeline] Spirula SfM crashed on exit after writing the camera model "
+              "(a known Spirula 2026.9.30 issue with AI matchers); keeping the model",
+              flush=True)
     registered = _registered_images(dataset)
     print(f"[pipeline] Spirula SfM registered {registered} of {image_count} images", flush=True)
     if registered < 3 or registered < MIN_REGISTERED_FRACTION * image_count:
@@ -1294,54 +1437,85 @@ def _run_spirula(videos: list[Path]) -> tuple[int, int, Path, float]:
             + (" (the 2.5x limit)" if steps == int(base * MAX_STEP_SCALE) else ""),
             flush=True,
         )
+    SPIRULA_RESULT["capture"] = _capture_stats(dataset, images_dir, image_count, registered)
     SPIRULA_RESULT["steps"] = steps
-    guidance = _spirula_geometry(spirula, dataset) if SPIRULA_GUIDANCE != "off" else "off"
+    guidance = (_spirula_geometry(spirula, dataset, registered)
+                if SPIRULA_GUIDANCE != "off" else "off")
+    if (SPIRULA_GUIDANCE not in ("off", "surfaces", "depth")
+            and extra_guidance.prepare(sys.modules[__name__], SPIRULA_GUIDANCE, dataset)):
+        guidance = SPIRULA_GUIDANCE
     SPIRULA_RESULT["guidance_used"] = guidance
-    cleanup = [
-        "--floater-suppression", SPIRULA_FLOATERS,
-        "--distraction-robustness", SPIRULA_DISTRACTION,
-    ]
-    if guidance == "off":
-        cleanup += ["--load-normals", "0", "--load-depths", "0"]
-    else:
-        cleanup += [
-            "--depth-distortion-reg", SPIRULA_DISTORTION_REG,
-            "--normal-distortion-reg", SPIRULA_DISTORTION_REG,
+
+    def train(guidance: str) -> None:
+        cleanup = [
+            "--floater-suppression", SPIRULA_FLOATERS,
+            "--distraction-robustness", SPIRULA_DISTRACTION,
         ]
-        if guidance == "depth":
-            cleanup += ["--depth-supervision-weight", f"{SPIRULA_DEPTH_WEIGHT:g}"]
+        if guidance == "off":
+            cleanup += ["--load-normals", "0", "--load-depths", "0"]
         else:
-            cleanup += ["--load-depths", "0"]
-    print(
-        f"[pipeline] starting Spirula training for {steps} iterations "
-        f"(quality: {SPIRULA_QUALITY}, up to {SPIRULA_PRESETS[SPIRULA_QUALITY][1]:,} splats; "
-        f"floater suppression: {SPIRULA_FLOATERS}; ignore moving things: "
-        f"{SPIRULA_DISTRACTION}; guidance: {guidance})",
-        flush=True,
-    )
+            cleanup += [
+                "--depth-distortion-reg", SPIRULA_DISTORTION_REG,
+                "--normal-distortion-reg", SPIRULA_DISTORTION_REG,
+            ]
+            if guidance in DEPTH_GUIDANCE:
+                cleanup += ["--depth-supervision-weight", f"{SPIRULA_DEPTH_WEIGHT:g}"]
+            else:
+                cleanup += ["--load-depths", "0"]
+            if guidance not in ("surfaces", "depth"):
+                cleanup += extra_guidance.train_flags(guidance, dataset)
+        print(
+            f"[pipeline] starting Spirula training for {steps} iterations "
+            f"(quality: {SPIRULA_QUALITY}, up to {SPIRULA_PRESETS[SPIRULA_QUALITY][1]:,} splats; "
+            f"floater suppression: {SPIRULA_FLOATERS}; ignore moving things: "
+            f"{SPIRULA_DISTRACTION}; guidance: {guidance})",
+            flush=True,
+        )
+        with _VramMonitor() as vram:
+            run_command(
+                [
+                    str(spirula), "train",
+                    # Positional preset: masked loss, centred on the object, mild cleanup.
+                    # Only with masks; without them it is an ordinary scene.
+                    *(["centered-object"] if SPIRULA_RESULT.get("object_masks") else []),
+                    # Spirula 2026.9.30 needs the region named; it does not look in <dataset>/roi itself.
+                    *(["--roi-region", str(dataset / "roi" / "main-scene.json")]
+                      if SPIRULA_RESULT.get("main_scene") else []),
+                    "--data", str(dataset),
+                    "--output-dir-prefix", str(TRAIN_OUTPUT_DIR),
+                    "--output-dir-name", SPIRULA_RUN_NAME,
+                    "--quality", SPIRULA_QUALITY,
+                    *(["--ppisp-param-type", "no_crf"] if SPIRULA_VIGNETTING else []),
+                    "--num-iterations", str(steps),
+                    "--primitive", SPIRULA_PRIMITIVE,
+                    *(["--viewer-port", str(PREVIEW_PORT)] if PREVIEW else ["--disable-viewer", "1"]),
+                    "--keep-viewer-alive", "0",
+                    *cleanup,
+                ],
+                cwd=JOB_ROOT,
+            )
+        TRAINING_VRAM.update(vram.summary() or {})
+
     timestamp_before = time.time()
-    run_command(
-        [
-            str(spirula), "train",
-            # Positional preset: masked loss, centred on the object, mild cleanup.
-            # Only with masks; without them it is an ordinary scene.
-            *(["centered-object"] if SPIRULA_RESULT.get("object_masks") else []),
-            # Spirula 2026.9.30 needs the region named; it does not look in <dataset>/roi itself.
-            *(["--roi-region", str(dataset / "roi" / "main-scene.json")]
-              if SPIRULA_RESULT.get("main_scene") else []),
-            "--data", str(dataset),
-            "--output-dir-prefix", str(TRAIN_OUTPUT_DIR),
-            "--output-dir-name", SPIRULA_RUN_NAME,
-            "--quality", SPIRULA_QUALITY,
-            *(["--ppisp-param-type", "no_crf"] if SPIRULA_VIGNETTING else []),
-            "--num-iterations", str(steps),
-            "--primitive", SPIRULA_PRIMITIVE,
-            *(["--viewer-port", str(PREVIEW_PORT)] if PREVIEW else ["--disable-viewer", "1"]),
-            "--keep-viewer-alive", "0",
-            *cleanup,
-        ],
-        cwd=JOB_ROOT,
-    )
+    try:
+        train(guidance)
+    except RuntimeError as exc:
+        # Maps kept from a crashed geometry step are the likely cause only if
+        # training fails while loading them, not hours in.
+        if (not SPIRULA_RESULT.get("guidance_salvaged")
+                or time.time() - timestamp_before > SALVAGED_GUIDANCE_GRACE):
+            raise
+        print(
+            f"[pipeline] WARNING: training failed with the kept guidance maps ({exc}); "
+            "retrying WITHOUT guidance.",
+            flush=True,
+        )
+        for name in ("normals", "depths"):
+            shutil.rmtree(dataset / name, ignore_errors=True)
+        shutil.rmtree(TRAIN_OUTPUT_DIR / SPIRULA_RUN_NAME, ignore_errors=True)
+        SPIRULA_RESULT["guidance_used"] = "off"
+        timestamp_before = time.time()
+        train("off")
     plys = sorted(TRAIN_OUTPUT_DIR.rglob("splat.ply"), key=lambda path: path.stat().st_mtime)
     if not plys:
         raise RuntimeError(
@@ -1433,25 +1607,26 @@ def _run_nerfstudio(video_path: Path | None) -> tuple[int, int, Path, float]:
     )
 
     timestamp_before = time.time()
-
-    run_command(
-        [
-            "ns-train",
-            "splatfacto",
-            "--data",
-            str(PROCESSED_DIR),
-            "--output-dir",
-            str(TRAIN_OUTPUT_DIR),
-            "--max-num-iterations",
-            str(MAX_STEPS),
-            "--pipeline.model.use-scale-regularization",
-            "True",
-            "--viewer.quit-on-train-completion",
-            "True",
-            *(["--viewer.websocket-port", str(PREVIEW_PORT)] if PREVIEW else []),
-        ],
-        cwd=JOB_ROOT,
-    )
+    with _VramMonitor() as vram:
+        run_command(
+            [
+                "ns-train",
+                "splatfacto",
+                "--data",
+                str(PROCESSED_DIR),
+                "--output-dir",
+                str(TRAIN_OUTPUT_DIR),
+                "--max-num-iterations",
+                str(MAX_STEPS),
+                "--pipeline.model.use-scale-regularization",
+                "True",
+                "--viewer.quit-on-train-completion",
+                "True",
+                *(["--viewer.websocket-port", str(PREVIEW_PORT)] if PREVIEW else []),
+            ],
+            cwd=JOB_ROOT,
+        )
+    TRAINING_VRAM.update(vram.summary() or {})
 
     configs = sorted(
         TRAIN_OUTPUT_DIR.rglob("config.yml"),
@@ -1826,7 +2001,7 @@ def run_pipeline() -> None:
         raise RuntimeError(f"Unknown floater suppression level: {SPIRULA_FLOATERS}")
     if SPIRULA_DISTRACTION not in {"off", "mild", "strong"}:
         raise RuntimeError(f"Unknown distraction robustness level: {SPIRULA_DISTRACTION}")
-    if SPIRULA_GUIDANCE not in {"off", "surfaces", "depth"}:
+    if SPIRULA_GUIDANCE not in GUIDANCE_LEVELS:
         raise RuntimeError(f"Unknown geometry guidance level: {SPIRULA_GUIDANCE}")
     if not 0 <= SPIRULA_DEPTH_WEIGHT <= 1:
         raise RuntimeError(f"Depth guidance strength must be 0 to 1, got {SPIRULA_DEPTH_WEIGHT}")
@@ -1922,16 +2097,20 @@ def run_pipeline() -> None:
         "spirula_object_masks": SPIRULA_RESULT.get("object_masks") if ENGINE == "spirula" else None,
         "spirula_guidance_requested": SPIRULA_GUIDANCE if ENGINE == "spirula" else None,
         "spirula_guidance_used": SPIRULA_RESULT.get("guidance_used") if ENGINE == "spirula" else None,
+        "spirula_guidance_salvaged": bool(SPIRULA_RESULT.get("guidance_salvaged")) if ENGINE == "spirula" else None,
         "spirula_primitive": SPIRULA_PRIMITIVE if ENGINE == "spirula" else None,
+        "capture": SPIRULA_RESULT.get("capture") if ENGINE == "spirula" else None,
         "fisheye": (
             {"focal_mm": FISHEYE_FOCAL_MM, "sensor_width_mm": SENSOR_WIDTH_MM,
              "focal_px": SPIRULA_RESULT.get("fisheye_focal_px")} if FISHEYE else None
         ),
         "spirula_depth_weight": (
             SPIRULA_DEPTH_WEIGHT
-            if ENGINE == "spirula" and SPIRULA_RESULT.get("guidance_used") == "depth" else None
+            if ENGINE == "spirula" and SPIRULA_RESULT.get("guidance_used") in DEPTH_GUIDANCE
+            else None
         ),
         "training_seconds": round(training_seconds, 3),
+        "training_vram": TRAINING_VRAM or None,
         "ply": str(destination),
     }
 

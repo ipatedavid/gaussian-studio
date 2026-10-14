@@ -159,6 +159,21 @@ class GpuAvailabilityTests(unittest.TestCase):
         self.assertFalse(options[0]["_available"])
         self.assertEqual(options[0]["_stock_status"], "No verified SSH/disk capacity")
 
+    def test_vram_range_keeps_cards_between_the_limits(self):
+        def card(name, memory):
+            return {"id": name, "displayName": name, "memoryInGb": memory,
+                    "communityCloud": True, "secureCloud": False, "communityPrice": 0.3,
+                    "communityOffer": {"stockStatus": "High", "uninterruptablePrice": 0.3}}
+
+        self.client._graphql = Mock(return_value={"gpuTypes": [
+            card("16 GB", 16), card("24 GB", 24), card("48 GB", 48), card("80 GB", 80)]})
+        names = lambda options: sorted(o["id"] for o in options)
+        self.assertEqual(names(self.client.select_gpu_types(0.55, 24, **self.kwargs)),
+                         ["24 GB", "48 GB", "80 GB"])
+        self.assertEqual(names(self.client.select_gpu_types(0.55, 24, max_vram_gb=48,
+                                                            **self.kwargs)),
+                         ["24 GB", "48 GB"])
+
     def test_available_offer_uses_matching_tier_and_on_demand_price(self):
         self.client._graphql = Mock(return_value={"gpuTypes": [{
             "id": "gpu1", "displayName": "GPU 1", "memoryInGb": 24,

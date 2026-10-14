@@ -14,6 +14,8 @@ desktop/jobs.db
 desktop/pod_ledger.json.tmp
 desktop/logs/
 desktop/results/
+desktop/runs.csv
+desktop/runs.csv.tmp
 
 # IDE
 .vscode/

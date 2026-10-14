@@ -22,9 +22,18 @@ import time
 from pathlib import Path
 from typing import Callable
 
+from config import EXTRA_WORKER_SCRIPTS, GUIDANCE_LEVELS
+
 
 class TransferError(RuntimeError):
     pass
+
+
+class ConnectionLostError(TransferError):
+    """ssh itself failed (exit code 255): the link dropped, the remote command may still run."""
+
+
+SSH_CONNECTION_LOST = 255
 
 
 REMOTE_OUTPUT_DIR = "/workspace/job/output"
@@ -448,7 +457,7 @@ print('finished from', ply)
     def upload_scripts(
         self, worker_dir: Path, log: Callable[[str], None] | None = None,
     ) -> None:
-        for filename in ("job.py", "pipeline.py"):
+        for filename in ("job.py", "pipeline.py", *EXTRA_WORKER_SCRIPTS):
             source = worker_dir / filename
             if not source.is_file():
                 raise TransferError(f"Worker script is missing: {source}")
@@ -741,7 +750,7 @@ print('finished from', ply)
             raise TransferError(f"Unknown feature matching: {spirula_matcher}")
         if spirula_distraction not in {"off", "mild", "strong"}:
             raise TransferError(f"Unknown distraction robustness level: {spirula_distraction}")
-        if spirula_guidance not in {"off", "surfaces", "depth"}:
+        if spirula_guidance not in GUIDANCE_LEVELS:
             raise TransferError(f"Unknown geometry guidance level: {spirula_guidance}")
         if not 0 <= float(spirula_depth_weight) <= 1:
             raise TransferError("Depth guidance strength must be between 0 and 1.")
@@ -789,7 +798,9 @@ print('finished from', ply)
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         ) as process:
             _stream_output(process, log)
-            if process.wait():
+            if process.wait() == SSH_CONNECTION_LOST:
+                raise ConnectionLostError("The SSH connection running the job dropped.")
+            if process.returncode:
                 raise TransferError(f"Remote pipeline failed with exit code {process.returncode}.")
         log("Remote image processing finished.")
 

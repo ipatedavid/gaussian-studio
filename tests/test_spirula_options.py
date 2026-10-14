@@ -16,7 +16,9 @@ from scp_client import ScpClient, TransferError
 
 class SpirulaOptionTests(unittest.TestCase):
     def run_spirula(self, *, floaters="off", guidance="off", geometry_fails=False,
-                    write_depths=True, preview=True, distraction="off"):
+                    write_depths=True, preview=True, distraction="off",
+                    crash_after_writing=False, train_fails_with_normals=False,
+                    sfm_crash=None):
         commands: list[list[str]] = []
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -31,9 +33,13 @@ class SpirulaOptionTests(unittest.TestCase):
                 commands.append(list(args))
                 verb = args[1]
                 if verb == "sfm":
+                    if sfm_crash == "before_writing":
+                        return pipeline.SEGFAULT_EXIT
                     model = processed / "sparse" / "0"
                     model.mkdir(parents=True)
                     (model / "images.bin").write_bytes(struct.pack("<Q", 5))
+                    if sfm_crash == "after_writing":
+                        return pipeline.SEGFAULT_EXIT
                 elif verb == "geometry":
                     if geometry_fails:
                         (processed / "normals").mkdir()
@@ -44,7 +50,11 @@ class SpirulaOptionTests(unittest.TestCase):
                     if "--depth" in args and write_depths:
                         (processed / "depths").mkdir()
                         (processed / "depths" / "p0.png").write_bytes(b"d")
+                    if crash_after_writing:
+                        raise RuntimeError("Command failed with exit code -11")
                 elif verb == "train":
+                    if train_fails_with_normals and "--load-normals" not in args:
+                        raise RuntimeError("Command failed with exit code 1")
                     (train_dir / "run").mkdir(parents=True)
                     (train_dir / "run" / "splat.ply").write_bytes(b"ply\n")
 
@@ -62,7 +72,8 @@ class SpirulaOptionTests(unittest.TestCase):
                 pipeline._run_spirula(None)
                 used = pipeline.SPIRULA_RESULT.get("guidance_used")
                 leftovers = (processed / "normals").exists()
-        train = next(command for command in commands if command[1] == "train")
+        self.trains = [command for command in commands if command[1] == "train"]
+        train = self.trains[-1]
         geometry = [command for command in commands if command[1] == "geometry"]
         return train, geometry, used, leftovers
 
@@ -118,6 +129,39 @@ class SpirulaOptionTests(unittest.TestCase):
         self.assertEqual(used, "off")
         self.assertFalse(leftovers)
         self.assertEqual(self.flag(train, "--load-normals"), "0")
+
+
+    def test_crash_after_every_map_is_written_keeps_the_guidance(self):
+        train, _, used, leftovers = self.run_spirula(guidance="surfaces",
+                                                     crash_after_writing=True)
+        self.assertEqual(used, "surfaces")
+        self.assertTrue(leftovers)
+        self.assertIsNone(self.flag(train, "--load-normals"))
+        self.assertEqual(len(self.trains), 1)
+
+    def test_crash_with_depth_maps_missing_keeps_surfaces_only(self):
+        train, _, used, _ = self.run_spirula(guidance="depth", crash_after_writing=True,
+                                             write_depths=False)
+        self.assertEqual(used, "surfaces")
+        self.assertEqual(self.flag(train, "--load-depths"), "0")
+
+    def test_training_that_rejects_kept_maps_reruns_without_them(self):
+        train, _, used, leftovers = self.run_spirula(
+            guidance="surfaces", crash_after_writing=True, train_fails_with_normals=True)
+        self.assertEqual(len(self.trains), 2)
+        self.assertEqual(used, "off")
+        self.assertFalse(leftovers)
+        self.assertEqual(self.flag(train, "--load-normals"), "0")
+
+
+    def test_sfm_crash_after_writing_the_model_keeps_it(self):
+        # Spirula 2026.9.30 segfaults on exit after AI matchers (ALIKED + LightGlue, LoMa).
+        train, _, _, _ = self.run_spirula(sfm_crash="after_writing")
+        self.assertEqual(train[1], "train")
+
+    def test_sfm_crash_before_writing_a_model_stops(self):
+        with self.assertRaisesRegex(RuntimeError, "before writing a camera model"):
+            self.run_spirula(sfm_crash="before_writing")
 
 
 class RunPipelineCommandTests(unittest.TestCase):

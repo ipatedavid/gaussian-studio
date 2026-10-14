@@ -286,6 +286,14 @@ QPushButton#textButton {{
 }}
 QPushButton#textButton:hover {{ background: {PRIMARY_HOVER}; }}
 QPushButton#textButton:disabled {{ color: {DISABLED_FG}; }}
+QPushButton#starButton {{
+    background: transparent;
+    color: {WARNING};
+    border: none;
+    padding: 2px 3px;
+    font-size: 20px;
+}}
+QPushButton#starButton:hover {{ background: {PRIMARY_HOVER}; }}
 QPushButton#dangerButton {{
     background: {ERROR_CONTAINER};
     color: {ON_ERROR_CONTAINER};

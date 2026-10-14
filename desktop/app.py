@@ -11,8 +11,8 @@ import shiboken6
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from config import (
-    DEFAULT_SPIRULA_IMAGE, ENGINE_LABELS, GUIDANCE_LABELS, MAX_STEP_SCALE, QUALITY_LEVELS,
-    PHOTOS_ITEM, STEP_REFERENCE_IMAGES, AppConfig, DriveKeyError, install_drive_key,
+    DEFAULT_SPIRULA_IMAGE, DEPTH_GUIDANCE, ENGINE_LABELS, EXTRA_GUIDANCE, GUIDANCE_LABELS,
+    MAX_STEP_SCALE, QUALITY_LEVELS, PHOTOS_ITEM, STEP_REFERENCE_IMAGES, AppConfig, DriveKeyError, install_drive_key,
     quality_steps, service_account_email, write_env_value,
 )
 from drive_client import DriveClient, DriveError, DriveFile, DriveListing
@@ -122,7 +122,9 @@ FLOATER_HELP = {
     "mild": "Mild: removes most stray blobs and see-through patches. A safe first thing to try.",
     "strong": (
         "Strong: cleans more aggressively, but can also erase thin real things such as "
-        "wires, railings, branches or hair. The best choice for shiny rooms."
+        "wires, railings, branches or hair, and fill the gaps between them. It holds back "
+        "the colour shift that shows reflections, so polished metal can look matte. The best "
+        "choice for shiny rooms."
     ),
 }
 REFLECTION_HELP = (
@@ -139,7 +141,8 @@ DISTRACTION_HELP = {
     "mild": "Mild: things that appear in only some frames count for less when placing splats.",
     "strong": (
         "Strong: ignores them more firmly. Can also lose real detail that only a few "
-        "frames saw clearly."
+        "frames saw clearly, and highlights that slide along shiny or thin objects can "
+        "count as moving."
     ),
 }
 PRIMITIVE_HELP = {
@@ -151,21 +154,23 @@ PRIMITIVE_HELP = {
         "Lens-accurate (3DGUT): models wide and fisheye lenses exactly. Tests on real "
         "fisheye footage show the clearest gains in rooms and other compact indoor spaces, "
         "and it gives cleaner geometry. Trains somewhat slower. Saves the same PLY format "
-        "as Standard, so SuperSplat and other viewers open it."
+        "as Standard, so SuperSplat and other viewers open it; they draw it with standard "
+        "splatting, so it can look slightly different from Spirula's own render."
     ),
 }
 GUIDANCE_HELP = {
     "off": "Off: no hints and nothing extra runs on the pod.",
     "surfaces": (
         "Surfaces (recommended): uses only the surface-direction hints, with the same "
-        "settings Spirula's own presets use for clean geometry. The AI step adds a few "
-        "minutes on the pod."
+        "settings Spirula's own presets use for clean geometry. The AI step adds 10–25 "
+        "minutes on the pod for about 400 photos, depending on the GPU."
     ),
     "depth": (
         "Surfaces + depth (experimental): also uses the AI's distance guesses. They are "
         "made one frame at a time and don't always agree with each other, so they can "
         "soften fine detail. Their strength is under Advanced options."
     ),
+    **{key: extra[2] for key, extra in EXTRA_GUIDANCE.items()},
 }
 
 
@@ -563,6 +568,7 @@ class JobView(QtWidgets.QWidget):
 
     STAGES = ("Start pod", "Upload", "Prepare", "Train", "Export", "Download")
     remove_requested = QtCore.Signal(object)
+    rating_changed = QtCore.Signal(object, object, str)   # job, 1-5 or None, note
 
     def __init__(self, job: JobController, context: str, rate: str):
         super().__init__()
@@ -623,6 +629,28 @@ class JobView(QtWidgets.QWidget):
             stage_row.addWidget(stage_label, 1)
             self.stage_labels.append(stage_label)
         overview_layout.addLayout(stage_row)
+        # Your own score of the result, kept with the job and in runs.csv.
+        self.rating_row = QtWidgets.QWidget()
+        rating_layout = QtWidgets.QHBoxLayout(self.rating_row)
+        rating_layout.setContentsMargins(0, 0, 0, 0)
+        rating_layout.setSpacing(2)
+        rating_layout.addWidget(label("Your rating", "helper"))
+        rating_layout.addSpacing(6)
+        self.stars = []
+        for value in range(1, 6):
+            star = QtWidgets.QPushButton()
+            star.setObjectName("starButton")
+            star.setToolTip(f"{value} of 5 (click again to clear)")
+            star.clicked.connect(lambda _checked=False, v=value: self._star_clicked(v))
+            rating_layout.addWidget(star)
+            self.stars.append(star)
+        self.rating_note = QtWidgets.QLineEdit(job.rating_note)
+        self.rating_note.setPlaceholderText("What looked good or bad?")
+        self.rating_note.editingFinished.connect(self._note_edited)
+        rating_layout.addSpacing(10)
+        rating_layout.addWidget(self.rating_note, 1)
+        overview_layout.addWidget(self.rating_row)
+        self._render_stars()
         splitter.addWidget(overview)
 
         self.tabs = QtWidgets.QTabWidget()
@@ -702,7 +730,7 @@ class JobView(QtWidgets.QWidget):
         splitter.addWidget(self.tabs)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([165, 420])
+        splitter.setSizes([200, 420])
         root.addWidget(splitter, 1)
 
         actions = QtWidgets.QHBoxLayout()
@@ -901,6 +929,21 @@ class JobView(QtWidgets.QWidget):
         self.open_results_button.setEnabled(
             job.results_dir is not None and job.results_dir.is_dir()
         )
+        self.rating_row.setVisible(job.outcome == "finished")
+
+    def _render_stars(self):
+        for value, star in enumerate(self.stars, start=1):
+            star.setText("★" if self.job.rating and value <= self.job.rating else "☆")
+
+    def _star_clicked(self, value: int):
+        rating = None if value == self.job.rating else value
+        self.rating_changed.emit(self.job, rating, self.rating_note.text().strip())
+        self._render_stars()
+
+    def _note_edited(self):
+        note = self.rating_note.text().strip()
+        if note != self.job.rating_note:
+            self.rating_changed.emit(self.job, self.job.rating, note)
 
     def _set_status(self, message: str):
         self.status.setText(message)
@@ -1503,9 +1546,14 @@ class MainWindow(QtWidgets.QMainWindow):
             "surface faces. Training uses those guesses as hints, so walls, floors and tables "
             "come out flat and solid instead of lumpy or hollow.",
             *GUIDANCE_HELP.values(),
+            "Every level except Off also adds a mild \"one surface per pixel\" push (the value "
+            "Spirula's own clean-geometry presets use), so a little of Floater suppression's "
+            "effect remains even with that set to Off. On thin, open structures it can fill "
+            "small gaps.",
         ))
         guidance_row, self.guidance_buttons = segment_row(
-            (("off", "Off"), ("surfaces", "Surfaces"), ("depth", "Surfaces + depth")), self,
+            (("off", "Off"), ("surfaces", "Surfaces"), ("depth", "Surfaces + depth"),
+             *((key, extra[0]) for key, extra in EXTRA_GUIDANCE.items())), self,
         )
         spirula_layout.addLayout(guidance_row)
         spirula_layout.addSpacing(4)
@@ -1569,9 +1617,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.depth_weight.setSingleStep(0.01)
         self.depth_weight.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons)
         self.depth_weight.setToolTip(
-            "How strongly the AI's distance guesses steer training (Spirula, 'Surfaces + "
-            "depth' only). 0.05 is a gentle starting point; higher pulls the geometry harder "
-            "toward the guesses, mistakes included."
+            "How strongly the AI's distance guesses steer training (Spirula, guidance levels "
+            "with depth). Training balances matching the photos against matching the depth's "
+            "shape; this is the weight of the second. 0.05 is a gentle nudge, about 0.2 gives "
+            "depth a real say where the photos are ambiguous, and 0.5 or more lets it "
+            "overrule them, mistakes included."
         )
         self.steps_override = QtWidgets.QCheckBox("Set by hand")
         self.steps_override.setToolTip(
@@ -1636,8 +1686,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.vram.setRange(1, 512)
         self.vram.setSuffix(" GB")
         self.vram.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons)
+        # Bigger cards cost more and sit mostly idle on Draft and Standard.
+        self.max_vram = QtWidgets.QSpinBox()
+        self.max_vram.setRange(0, 512)
+        self.max_vram.setSuffix(" GB")
+        self.max_vram.setSpecialValueText("No limit")
+        self.max_vram.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons)
         filters.addWidget(field("Maximum price", self.price), 1)
         filters.addWidget(field("Minimum VRAM", self.vram), 1)
+        filters.addWidget(field("Maximum VRAM", self.max_vram), 1)
         details.addLayout(filters)
         self.gpu_list = QtWidgets.QListWidget()
         self.gpu_list.setObjectName("gpuList")
@@ -1767,6 +1824,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.price.valueChanged.connect(self._invalidate_gpus)
         self.vram.valueChanged.connect(self._invalidate_gpus)
         self.vram.valueChanged.connect(self._update_quality_summary)
+        self.max_vram.valueChanged.connect(self._invalidate_gpus)
+        self.max_vram.valueChanged.connect(self._update_quality_summary)
         self.downscales.valueChanged.connect(self._source_settings_changed)
         self.steps.valueChanged.connect(self._update_quality_summary)
 
@@ -1779,6 +1838,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.video_fps.setValue(self.config.video_fps)
         self.price.setValue(self.config.max_gpu_price)
         self.vram.setValue(self.config.min_gpu_vram_gb)
+        self.max_vram.setValue(self.config.max_gpu_vram_gb)
         self.steps.setValue(self.config.pipeline_max_steps)
         self.downscales.setValue(self.config.pipeline_num_downscales)
         self.drive_mode.setChecked(self.config.input_kind == "drive")
@@ -1854,7 +1914,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         if self.fisheye.isChecked():
             text = f"fisheye {self.fisheye_focal.value():g} mm · " + text
-        if self._guidance() == "depth":
+        if self._guidance() in DEPTH_GUIDANCE:
             text += f" ({self.depth_weight.value():g})"
         if self._distraction() != "off":
             text += f" · ignore moving: {self._distraction()}"
@@ -1897,6 +1957,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.config.video_fps = self.video_fps.value()
         self.config.max_gpu_price = self.price.value()
         self.config.min_gpu_vram_gb = self.vram.value()
+        self.config.max_gpu_vram_gb = self.max_vram.value()
         self.config.pipeline_max_steps = self.steps.value()
         self.config.pipeline_num_downscales = self.downscales.value()
         self.config.save_state()
@@ -2238,6 +2299,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _gpu_signature(self, plan: InputPlan):
         common = (
             self.config.runpod_api_key, self.price.value(), self.vram.value(),
+            self.max_vram.value(),
             plan.kind, plan.volume_gb, plan.frame_target, self.downscales.value(),
         )
         if plan.is_drive:
@@ -2290,9 +2352,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self.steps.blockSignals(True)
             self.steps.setValue(self._effective_steps())
             self.steps.blockSignals(False)
-        ultra_short = self._quality() == "ultra" and self.vram.value() < 40
+        capped = 0 < self.max_vram.value() < 40
+        ultra_short = self._quality() == "ultra" and (self.vram.value() < 40 or capped)
         self.quality_notice.setText(
-            "Ultra needs a GPU with about 48 GB. Raise Minimum VRAM under GPU > Change."
+            "Ultra needs a GPU with about 48 GB. "
+            + ("Raise or clear Maximum VRAM" if capped else "Raise Minimum VRAM")
+            + " under GPU > Change."
         )
         self.quality_notice.setVisible(engine == "spirula" and ultra_short)
         conflict = self.fisheye.isChecked() and engine != "spirula"
@@ -2300,7 +2365,8 @@ class MainWindow(QtWidgets.QMainWindow):
             "Fisheye photos need Spirula Studio. Switch the engine under Training > Advanced."
         )
         self.fisheye_help.setVisible(conflict)
-        self.depth_weight.setEnabled(engine == "spirula" and self._guidance() == "depth")
+        self.depth_weight.setEnabled(engine == "spirula"
+                                     and self._guidance() in DEPTH_GUIDANCE)
         # Only worth a line when it isn't the default.
         self.engine_hint.setVisible(engine != "spirula")
         if engine == "spirula":
@@ -2524,15 +2590,21 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 self.gpu_hint.setText(
                     f"{basis} of {available} available option{'s' if available != 1 else ''} "
-                    f"within ${self.price.value():.2f}/hr and {self.vram.value()} GB VRAM."
+                    f"within ${self.price.value():.2f}/hr and {self._vram_range_text()} VRAM."
                 )
         else:
             self.gpu_list.setCurrentRow(-1)
             self.gpu_choice.setText("No GPU available within your limits.")
             self.gpu_hint.setText(
-                "Raise the price limit or lower the VRAM under Change, then Refresh."
+                "Raise the price limit or widen the VRAM range under Change, then Refresh."
             )
         self._update_run_enabled()
+
+    def _vram_range_text(self) -> str:
+        low, high = self.vram.value(), self.max_vram.value()
+        if not high:
+            return f"{low}+ GB"
+        return f"{low}-{high} GB" if high != low else f"{low} GB"
 
     def _speed_model(self) -> SpeedModel:
         """GPU speeds and job estimates from the finished jobs in history."""
@@ -2700,6 +2772,7 @@ class MainWindow(QtWidgets.QMainWindow):
         view = JobView(job, context, job.rate_text or "pending")
         disable_wheel_changes(view)
         view.remove_requested.connect(self._remove_job)
+        view.rating_changed.connect(self.manager.rate_job)
         self._views[job] = view
         self.pages.addWidget(view)
         card_widget = JobCard(job, context)
@@ -2723,6 +2796,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _load_history(self):
         for job in self.manager.load_history():
             self._add_job_widgets(job, select=False, top=False)
+        self.manager.write_runs_table()
 
     def _select_job(self, job: JobController):
         item = self._cards.get(job, (None, None))[0]

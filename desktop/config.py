@@ -15,11 +15,18 @@ _NEVER_SAVED = frozenset({"runpod_api_key", "google_service_account_file"})
 ENGINES = ("nerfstudio", "spirula")
 ENGINE_LABELS = {"nerfstudio": "Nerfstudio", "spirula": "Spirula Studio"}
 FLOATER_LEVELS = ("off", "mild", "strong")
-GUIDANCE_LEVELS = ("off", "surfaces", "depth")
+try:  # options kept out of the public repo
+    from extra_options import GUIDANCE as EXTRA_GUIDANCE, WORKER_SCRIPTS as EXTRA_WORKER_SCRIPTS
+except ImportError:
+    EXTRA_GUIDANCE, EXTRA_WORKER_SCRIPTS = {}, ()
+GUIDANCE_LEVELS = ("off", "surfaces", "depth", *EXTRA_GUIDANCE)
+# Levels that train against depth maps and use the depth strength setting.
+DEPTH_GUIDANCE = ("depth", *(key for key, extra in EXTRA_GUIDANCE.items() if extra[3]))
 # Feature matching for Spirula's camera solver.
 MATCHERS = ("sift", "aliked", "loma")
 MATCHER_LABELS = {"sift": "Standard (SIFT)", "aliked": "Learned (ALIKED + LightGlue)", "loma": "LoMa"}
-GUIDANCE_LABELS = {"off": "off", "surfaces": "surfaces", "depth": "surfaces + depth"}
+GUIDANCE_LABELS = {"off": "off", "surfaces": "surfaces", "depth": "surfaces + depth",
+                   **{key: extra[1] for key, extra in EXTRA_GUIDANCE.items()}}
 PRIMITIVES = ("3dgs", "3dgut")
 # Spirula quality presets: (label, training steps, splat budget).
 QUALITY_LEVELS = {
@@ -151,6 +158,7 @@ class AppConfig:
     video_fps: float = float(os.getenv("VIDEO_FPS", "3"))  # frames taken per second of video
     max_gpu_price: float = float(os.getenv("MAX_GPU_PRICE_PER_HOUR", "0.55"))
     min_gpu_vram_gb: int = int(os.getenv("MIN_GPU_VRAM_GB", "24"))
+    max_gpu_vram_gb: int = int(os.getenv("MAX_GPU_VRAM_GB", "0"))  # 0: no limit
     gpu_count: int = 1
     cloud_type: str = os.getenv("CLOUD_TYPE", "ALL")
     container_disk_gb: int = int(os.getenv("CONTAINER_DISK_GB", "30"))

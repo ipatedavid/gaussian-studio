@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -18,7 +19,7 @@ import job_controller
 from config import AppConfig
 from job_controller import JobController
 from job_manager import JobManager
-from scp_client import ScpClient
+from scp_client import ConnectionLostError, ScpClient
 
 APP = QtCore.QCoreApplication.instance() or QtCore.QCoreApplication([])
 
@@ -85,6 +86,50 @@ class FollowRemoteJobTests(unittest.TestCase):
         self.assertEqual(transfer.finished_with, "spirula")
 
 
+class RejoinAfterDropTests(unittest.TestCase):
+    """The SSH session running the job drops (ssh exit 255) while the pod keeps going."""
+
+    def rejoin(self, transfer):
+        job = JobController(AppConfig())
+        logs = []
+        job.log_line.connect(logs.append, QtCore.Qt.DirectConnection)
+        transfer.has_job_log = lambda: False
+        with patch.object(job._stop_requested, "wait", return_value=False):
+            job._rejoin_job(transfer, "spirula", ConnectionLostError("dropped"))
+        return logs
+
+    def test_a_running_job_is_followed_to_the_end(self):
+        transfer = FakeTransfer([state(True, True, False, 5600), state(False, False, True, 63000)])
+        logs = self.rejoin(transfer)
+        self.assertIn("Reconnected; the job is still going.", logs)
+        self.assertIn("The pod finished the job on its own.", logs)
+
+    def test_an_unreachable_pod_keeps_the_original_error(self):
+        class Unreachable(FakeTransfer):
+            def remote_job_state(self):
+                raise OSError("no route")
+        with self.assertRaises(ConnectionLostError):
+            self.rejoin(Unreachable([]))
+
+    def test_a_job_that_died_with_no_result_keeps_the_original_error(self):
+        with self.assertRaises(ConnectionLostError):
+            self.rejoin(FakeTransfer([state(False, False, False, 5600)]))
+
+    def test_ssh_exit_255_is_a_lost_connection(self):
+        client = ScpClient(Path("/nonexistent"), "127.0.0.1", 22)
+        with patch("scp_client._stream_output"), \
+                patch("subprocess.Popen") as popen:
+            popen.return_value.__enter__.return_value.wait.return_value = 255
+            popen.return_value.__enter__.return_value.returncode = 255
+            with self.assertRaises(ConnectionLostError):
+                client.run_pipeline(1000, 0, lambda line: None)
+            popen.return_value.__enter__.return_value.wait.return_value = 1
+            popen.return_value.__enter__.return_value.returncode = 1
+            with self.assertRaises(Exception) as failed:
+                client.run_pipeline(1000, 0, lambda line: None)
+            self.assertNotIsInstance(failed.exception, ConnectionLostError)
+
+
 class CloseWhileRunningTests(unittest.TestCase):
     def test_only_jobs_processing_on_their_pod_may_be_left(self):
         job = JobController(AppConfig())
@@ -114,8 +159,91 @@ class WorkerLogTests(unittest.TestCase):
                 tee = job._Tee(GoneSession(), log)
                 print("step 100/60000", file=tee, flush=True)
                 print("step 200/60000", file=tee, flush=True)
+                tee.close()
             self.assertEqual((Path(tmp) / "job.log").read_text().split(),
                              ["step", "100/60000", "step", "200/60000"])
+
+    def test_a_stalled_session_does_not_hang_the_job(self):
+        # The app's computer vanished without closing the connection: writes block.
+        sys.path.insert(0, str(ROOT / "worker"))
+        import job
+
+        stuck = threading.Event()
+
+        class StalledSession:
+            def write(self, text):
+                stuck.wait()
+
+            def flush(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(Path(tmp) / "job.log", "a", encoding="utf-8") as log:
+                tee = job._Tee(StalledSession(), log)
+                started = time.monotonic()
+                for step in range(job._Tee.QUEUE_SIZE + 100):
+                    print(f"step {step}", file=tee, flush=True)
+                tee.close(timeout=0.2)
+                self.assertLess(time.monotonic() - started, 5)
+                self.assertIsNone(tee.stream)
+                stuck.set()
+            lines = (Path(tmp) / "job.log").read_text().splitlines()
+            self.assertEqual(len(lines), job._Tee.QUEUE_SIZE + 100)
+
+    def test_a_live_session_gets_every_line(self):
+        sys.path.insert(0, str(ROOT / "worker"))
+        import job
+
+        class Session:
+            def __init__(self):
+                self.text = ""
+
+            def write(self, text):
+                self.text += text
+
+            def flush(self):
+                pass
+
+        session = Session()
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(Path(tmp) / "job.log", "a", encoding="utf-8") as log:
+                tee = job._Tee(session, log)
+                for step in range(50):
+                    print(f"step {step}", file=tee, flush=True)
+                tee.close()
+        self.assertEqual(session.text.splitlines(), [f"step {n}" for n in range(50)])
+
+
+    def test_a_failing_job_reports_its_error_to_the_app(self):
+        sys.path.insert(0, str(ROOT / "worker"))
+        import job
+
+        class Session:
+            def __init__(self):
+                self.text = ""
+
+            def write(self, text):
+                self.text += text
+
+            def flush(self):
+                pass
+
+        def failing_pipeline():
+            raise RuntimeError("Command failed with exit code 1: spirula sfm")
+
+        session = Session()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "input").mkdir()
+            with patch.object(job, "INPUT_DIR", root / "input"), \
+                 patch.object(job, "JOB_LOG", root / "job.log"), \
+                 patch.object(job, "run_pipeline", failing_pipeline), \
+                 patch.object(job.signal, "signal"), \
+                 patch.object(sys, "stdout", session), patch.object(sys, "stderr", session):
+                with self.assertRaises(SystemExit):
+                    job.main()
+            self.assertIn("exit code 1: spirula sfm", (root / "job.log").read_text())
+        self.assertIn("exit code 1: spirula sfm", session.text)
 
 
 class ReattachEntryTests(unittest.TestCase):

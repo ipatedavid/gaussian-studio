@@ -24,6 +24,7 @@ from config import APP_DIR, AppConfig
 from job_controller import JobController
 from job_history import JobHistory
 from pod_ledger import PodLedger
+import run_report
 from runpod_client import RunPodClient
 
 POD_NAME_PREFIX = "gaussian-"
@@ -52,6 +53,8 @@ class JobManager(QtCore.QObject):
         self.ledger = PodLedger(ledger_path)
         self.log_dir = log_dir
         self.history = JobHistory(history_path)
+        self.runs_path = Path(history_path).with_name(run_report.RUNS_CSV.name)
+        self._runs_lock = threading.Lock()
         self.jobs: list[JobController] = []
         self.untracked: list[dict] = []
         self._lock = threading.Lock()
@@ -174,6 +177,8 @@ class JobManager(QtCore.QObject):
             "results_dir": str(job.results_dir) if job.results_dir else None,
             "log_path": str(job.log_path) if job.log_path else None,
             "running": job.running,
+            "rating": job.rating,
+            "rating_note": job.rating_note,
         }
 
     def _save(self, job: JobController) -> None:
@@ -181,6 +186,26 @@ class JobManager(QtCore.QObject):
             self.history.save(self.snapshot(job))
         except Exception:
             pass  # history is a convenience; never let it break a job
+
+    def rate_job(self, job: JobController, rating: int | None, note: str) -> None:
+        job.rating = rating
+        job.rating_note = note
+        self._save(job)
+        self.write_runs_table()
+
+    def write_runs_table(self) -> threading.Thread:
+        """Rewrite runs.csv (one row of numbers per job) in the background."""
+        def write():
+            with self._runs_lock:
+                try:
+                    run_report.write_csv(run_report.build_rows(self.history.recent(1000)),
+                                         self.runs_path)
+                except Exception:
+                    pass  # a convenience; never let it disturb the app
+
+        thread = threading.Thread(target=write, daemon=True)
+        thread.start()
+        return thread
 
     def _track(self, job: JobController) -> None:
         """Save the job now and whenever its state changes (from the job's own thread)."""
@@ -192,6 +217,7 @@ class JobManager(QtCore.QObject):
         job.status_changed.connect(lambda _text: self._save(job), QtCore.Qt.DirectConnection)
         job.active_pod_changed.connect(pod_changed, QtCore.Qt.DirectConnection)
         job.finished.connect(lambda _ok: self._save(job), QtCore.Qt.DirectConnection)
+        job.finished.connect(lambda _ok: self.write_runs_table(), QtCore.Qt.DirectConnection)
         self._save(job)
 
     def load_history(self) -> list[JobController]:
@@ -240,6 +266,8 @@ class JobManager(QtCore.QObject):
         if record.get("results_dir"):
             job.results_dir = Path(record["results_dir"])
         job.log_path = Path(record["log_path"]) if record.get("log_path") else None
+        job.rating = record.get("rating")
+        job.rating_note = record.get("rating_note") or ""
         return job
 
     def busy_jobs(self) -> list[JobController]:
@@ -270,6 +298,7 @@ class JobManager(QtCore.QObject):
                     container_disk_gb=config.container_disk_gb,
                     volume_gb=volume_gb,
                     min_vcpu=config.min_vcpu,
+                    max_vram_gb=config.max_gpu_vram_gb,
                     min_memory_gb=config.min_memory_gb,
                 )
                 self.gpu_candidates_changed.emit(candidates)
