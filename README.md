@@ -1,6 +1,6 @@
 # Gaussian Studio
 
-A desktop app for Linux and macOS that turns photos, videos, or both into a Gaussian
+A desktop app for Linux, macOS and Windows that turns photos, videos, or both into a Gaussian
 splat, using a GPU rented from [RunPod](https://www.runpod.io) for each job.
 
 - Pick a folder on your computer or in Google Drive, and untick anything to leave out.
@@ -22,6 +22,10 @@ git clone https://github.com/ipatedavid/gaussian-studio.git gaussian-studio
 cd gaussian-studio
 ./install.sh
 ```
+
+On Windows, download the ZIP (**Code → Download ZIP**), extract it and double-click
+**install.cmd**. To remove the app later, run `uninstall.sh` or `uninstall.cmd`
+([details](SETUP.md#uninstalling)).
 
 Then open **Gaussian Studio** from your desktop and paste your RunPod API key in
 **Settings → Connection**.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -243,6 +244,7 @@ class WorkerLogTests(unittest.TestCase):
         self.assertEqual(session.text.splitlines(), [f"step {n}" for n in range(50)])
 
 
+    @unittest.skipIf(os.name == "nt", "pod-side code: pods run Linux")
     def test_a_failing_job_reports_its_error_to_the_app(self):
         sys.path.insert(0, str(ROOT / "worker"))
         import job
@@ -298,10 +300,12 @@ class ReattachEntryTests(unittest.TestCase):
                 job._thread and job._thread.join(5)
             self.assertEqual(seen, [("ac1605f0b85d", "MVI_4394.MP4", "spirula", "bf8", 0.27)])
             self.assertEqual(manager.untracked, [])
+            manager.history.close()
             self.assertIn(job, manager.jobs)
             self.assertEqual(job.pod_name, "gaussian-ac1605f0b85d")
 
 
+@unittest.skipIf(os.name == "nt", "pod-side code: pods run Linux")
 class PodScriptTests(unittest.TestCase):
     def test_state_script_runs_and_reports_json(self):
         result = subprocess.run(

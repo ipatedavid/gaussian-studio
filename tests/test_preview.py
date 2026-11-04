@@ -114,6 +114,7 @@ for _name in [n for n in dir(flow.JobFlowTests) if n.startswith("test_")]:
     setattr(PreviewFlowTests, _name, None)
 
 
+@unittest.skipIf(os.name == "nt", "the fake ssh and scp are Unix scripts")
 class TunnelCommandTests(unittest.TestCase):
     def test_open_tunnel_forwards_a_local_port(self):
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Viewer)

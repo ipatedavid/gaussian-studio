@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import stat
 import sys
 import tempfile
@@ -38,18 +39,21 @@ class SettingsKeyTests(unittest.TestCase):
         values = dotenv_values(self.env)
         self.assertEqual(values["RUNPOD_API_KEY"], "rpa_new")
         self.assertEqual(values["MAX_GPU_PRICE_PER_HOUR"], "0.55")
-        self.assertEqual(stat.S_IMODE(self.env.stat().st_mode), 0o600)
+        if os.name != "nt":  # Windows has no Unix file modes
+            self.assertEqual(stat.S_IMODE(self.env.stat().st_mode), 0o600)
 
     def test_creates_env_when_missing(self):
         config.write_env_value("RUNPOD_API_KEY", "rpa_test")
         self.assertEqual(dotenv_values(self.env)["RUNPOD_API_KEY"], "rpa_test")
-        self.assertEqual(stat.S_IMODE(self.env.stat().st_mode), 0o600)
+        if os.name != "nt":  # Windows has no Unix file modes
+            self.assertEqual(stat.S_IMODE(self.env.stat().st_mode), 0o600)
 
     def test_drive_key_is_copied_and_env_points_at_it(self):
         installed = config.install_drive_key(self._download())
         self.assertEqual(installed, self.key)
         self.assertEqual(json.loads(self.key.read_text())["type"], "service_account")
-        self.assertEqual(stat.S_IMODE(self.key.stat().st_mode), 0o600)
+        if os.name != "nt":  # Windows has no Unix file modes
+            self.assertEqual(stat.S_IMODE(self.key.stat().st_mode), 0o600)
         self.assertEqual(dotenv_values(self.env)["GOOGLE_SERVICE_ACCOUNT_FILE"], "service-account.json")
 
     def test_choosing_the_installed_key_again_keeps_it(self):

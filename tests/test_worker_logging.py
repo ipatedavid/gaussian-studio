@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import io
 import json
-import tempfile
+import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -16,6 +17,7 @@ import pipeline
 from pipeline import _forward_output
 
 
+@unittest.skipIf(os.name == "nt", "pod-side code: pods run Linux")
 class WorkerOutputTests(unittest.TestCase):
     def test_forwards_carriage_return_progress(self):
         script = (

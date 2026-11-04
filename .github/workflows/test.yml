@@ -34,3 +34,90 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
         run: python -m unittest discover -s tests -v
+
+      # What a Linux user does, from a folder with a space in its path; the uninstaller
+      # deletes that folder, so it is a copy rather than this checkout.
+      - name: Install with install.sh, then uninstall with uninstall.sh
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          app="$RUNNER_TEMP/my apps/gaussian studio"
+          mkdir -p "$app" && cp -r . "$app"
+          "$app/install.sh"
+          test -f ~/.local/share/applications/gaussian-studio.desktop
+          "$app/desktop/.venv/bin/python" -c "import PySide6"
+          mkdir -p "$app/desktop/results/job 1" && echo ply > "$app/desktop/results/job 1/gaussian_splat.ply"
+          cd "$RUNNER_TEMP"
+          "$app/uninstall.sh" --yes --delete-key
+          test ! -e "$app"
+          test ! -e ~/.local/share/applications/gaussian-studio.desktop
+          test -f ~/"Gaussian Studio results/job 1/gaussian_splat.ply"
+          test ! -e ~/.ssh/id_ed25519 || ! grep -q gaussian-studio ~/.ssh/id_ed25519.pub
+
+  windows:
+    runs-on: windows-2022
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install desktop and test dependencies
+        run: python -m pip install -r desktop/requirements.txt -r tests/requirements.txt
+
+      - name: Run the tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+          PYTHONUTF8: '1'
+          GS_REQUIRE_REAL_SSH: '1'
+        run: python -m unittest discover -s tests -v
+
+      # The rest is what a Windows user does, in Windows PowerShell 5.1 as install.cmd runs
+      # it, from a folder with a space in its path. The uninstaller deletes that folder, so
+      # it is a copy rather than this checkout.
+      - name: Install with install.ps1
+        shell: powershell
+        run: |
+          $app = Join-Path $env:RUNNER_TEMP 'my apps\gaussian studio'
+          New-Item -ItemType Directory -Force $app | Out-Null
+          Copy-Item -Recurse -Force * $app
+          powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $app 'install.ps1')
+          if ($LASTEXITCODE) { throw "install.ps1 failed ($LASTEXITCODE)" }
+
+      - name: Start the app from its Start menu shortcut
+        shell: powershell
+        run: |
+          $link = Join-Path ([Environment]::GetFolderPath('Programs')) 'Gaussian Studio.lnk'
+          if (-not (Test-Path $link)) { throw 'no Start menu shortcut' }
+          $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($link)
+          "$($shortcut.TargetPath) $($shortcut.Arguments) (in $($shortcut.WorkingDirectory))"
+          $env:QT_QPA_PLATFORM = 'offscreen'
+          $process = Start-Process $shortcut.TargetPath $shortcut.Arguments -WorkingDirectory $shortcut.WorkingDirectory -PassThru
+          Start-Sleep 20
+          $log = Join-Path $shortcut.WorkingDirectory 'logs\app.log'
+          if (Test-Path $log) { Get-Content $log }
+          if ($process.HasExited) { throw "the app exited with $($process.ExitCode)" }
+          Stop-Process -Id $process.Id -Force
+          Start-Sleep 2
+          if ((Test-Path $log) -and (Select-String -Quiet 'Traceback' $log)) { throw 'the app logged an error' }
+
+      - name: Uninstall with uninstall.ps1
+        shell: powershell
+        run: |
+          $app = Join-Path $env:RUNNER_TEMP 'my apps\gaussian studio'
+          New-Item -ItemType Directory -Force (Join-Path $app 'desktop\results\job 1') | Out-Null
+          Set-Content (Join-Path $app 'desktop\results\job 1\gaussian_splat.ply') 'ply'
+          Set-Location $env:RUNNER_TEMP
+          powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $app 'uninstall.ps1') --yes --delete-key
+          if ($LASTEXITCODE) { throw "uninstall.ps1 failed ($LASTEXITCODE)" }
+          if (Test-Path $app) { throw 'the app folder is still there' }
+          foreach ($folder in [Environment]::GetFolderPath('Programs'), [Environment]::GetFolderPath('Desktop')) {
+            if (Test-Path (Join-Path $folder 'Gaussian Studio.lnk')) { throw "a shortcut is left in $folder" }
+          }
+          $kept = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'Gaussian Studio results\job 1\gaussian_splat.ply'
+          if (-not (Test-Path $kept)) { throw 'the results were not moved out' }
+          if (Test-Path (Join-Path $HOME '.ssh\id_ed25519')) { throw 'the SSH key was not deleted' }

@@ -26,6 +26,10 @@ def main() -> None:
     # (WM_CLASS on X11, app id on Wayland); see install_launcher.py.
     app.setApplicationName("gaussian-studio")
     app.setDesktopFileName("gaussian-studio")
+    if sys.platform == "win32":
+        # Its own taskbar button and icon, rather than Python's.
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("GaussianStudio")
     icon = APP_DIR / "assets" / "gaussian-studio.png"
     if icon.is_file():
         app.setWindowIcon(QtGui.QIcon(str(icon)))

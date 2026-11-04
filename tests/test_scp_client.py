@@ -65,6 +65,7 @@ class UploadBatchTests(unittest.TestCase):
                     client.upload([image], reserve_bytes=1000)
             batch.assert_not_called()
 
+    @unittest.skipIf(os.name == "nt", "the fake ssh and scp are Unix scripts")
     def test_scp_batch_uses_one_process_for_all_photos(self):
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary)
@@ -96,6 +97,7 @@ class UploadBatchTests(unittest.TestCase):
             self.assertEqual(arguments[-1], "root@example:/workspace/job/input/")
             self.assertTrue(any("100%" in line for line in logs))
 
+    @unittest.skipIf(os.name == "nt", "the fake ssh and scp are Unix scripts")
     def test_download_logs_progress(self):
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary)
@@ -168,6 +170,7 @@ class UploadBatchTests(unittest.TestCase):
             client.download(folder / "results", logs.append)
         return logs
 
+    @unittest.skipIf(os.name == "nt", "the fake ssh and scp are Unix scripts")
     def test_large_result_downloads_over_parallel_connections(self):
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary)
@@ -180,6 +183,7 @@ class UploadBatchTests(unittest.TestCase):
             self.assertFalse((folder / "scp-used").exists() and not
                              (folder / "results" / "pipeline_summary.json").exists())
 
+    @unittest.skipIf(os.name == "nt", "the fake ssh and scp are Unix scripts")
     def test_camera_solve_downloads_when_the_pod_saved_one(self):
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary)
@@ -190,6 +194,7 @@ class UploadBatchTests(unittest.TestCase):
             saved = folder / "results" / "cameras.zip"
             self.assertEqual(saved.read_bytes(), (output / "cameras.zip").read_bytes())
 
+    @unittest.skipIf(os.name == "nt", "the fake ssh and scp are Unix scripts")
     def test_missing_or_broken_camera_solve_leaves_the_result_alone(self):
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary)
@@ -204,6 +209,7 @@ class UploadBatchTests(unittest.TestCase):
             self.assertTrue((results / "gaussian_splat.ply").is_file())
             self.assertTrue(any("camera positions could not be downloaded" in line for line in logs))
 
+    @unittest.skipIf(os.name == "nt", "the fake ssh and scp are Unix scripts")
     def test_parallel_parts_resume_after_dropped_connections(self):
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary)
@@ -214,6 +220,7 @@ class UploadBatchTests(unittest.TestCase):
             self.assertEqual(result.read_bytes(), (output / "gaussian_splat.ply").read_bytes())
             self.assertTrue(any("Downloaded and verified" in line for line in logs))
 
+    @unittest.skipIf(os.name == "nt", "the fake ssh and scp are Unix scripts")
     def test_checksum_mismatch_falls_back_to_scp(self):
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary)
@@ -231,6 +238,7 @@ class UploadBatchTests(unittest.TestCase):
                 (output / "gaussian_splat.ply").read_bytes(),
             )
 
+    @unittest.skipIf(os.name == "nt", "the fake ssh and scp are Unix scripts")
     def test_scp_batch_reports_transfer_failure(self):
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary)
@@ -293,6 +301,83 @@ class StreamingOutputTests(unittest.TestCase):
             _stream_output(process, logs.append, heartbeat_seconds=.05)
             self.assertEqual(process.wait(), 0)
         self.assertTrue(any("still running" in line for line in logs))
+
+
+@unittest.skipIf(os.name == "nt", "the fake ssh is a Unix script")
+class WindowsTransferTests(unittest.TestCase):
+    """The Windows path (tar and cat over plain ssh), run here with a fake ssh that
+    executes the pod's command on this computer, with `/pod` mapped to a folder."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.folder = Path(self.temporary.name)
+        self.pod = self.folder / "pod"
+        (self.pod / "input").mkdir(parents=True)
+        fake_ssh = self.folder / "bin" / "ssh"
+        fake_ssh.parent.mkdir()
+        fake_ssh.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, subprocess, sys\n"
+            "open(os.environ['FAKE_POD'] + '/../calls', 'a').write(sys.argv[-1] + '\\n')\n"
+            "command = sys.argv[-1].replace('/pod', os.environ['FAKE_POD'])\n"
+            "sys.exit(subprocess.run(['bash', '-c', command]).returncode)\n"
+        )
+        fake_ssh.chmod(0o755)
+        self.client = ScpClient(Path("/tmp/test-key"), "example", 1234)
+        self.logs: list[str] = []
+        self.env = patch.dict(os.environ, {
+            "PATH": f"{fake_ssh.parent}:{os.environ['PATH']}", "FAKE_POD": str(self.pod)})
+        self.env.start()
+        self.windows = patch("scp_client.WINDOWS", True)
+        self.windows.start()
+
+    def tearDown(self):
+        self.windows.stop()
+        self.env.stop()
+        self.temporary.cleanup()
+
+    def calls(self) -> str:
+        return (self.folder / "calls").read_text()
+
+    def test_photo_batch_goes_as_one_tar_stream_into_the_folder(self):
+        photos = []
+        for index, size in enumerate((10, 3 * 1024 ** 2, 0)):
+            photo = self.folder / f"photo {index}.jpg"
+            photo.write_bytes(os.urandom(size))
+            photos.append(photo)
+        self.client._upload_batch(photos, self.logs.append, destination="root@example:/pod/input/")
+        for photo in photos:
+            self.assertEqual((self.pod / "input" / photo.name).read_bytes(), photo.read_bytes())
+        self.assertEqual(self.calls().count("tar -x"), 1)
+        self.assertTrue(any("[SCP]" in line and "100%" in line for line in self.logs))
+
+    def test_single_file_lands_under_its_new_name(self):
+        video = self.folder / "clip.mp4"
+        video.write_bytes(b"video")
+        self.client._upload_batch([video], None, destination="root@example:/pod/input/v01_clip.mp4")
+        self.assertEqual((self.pod / "input" / "v01_clip.mp4").read_bytes(), b"video")
+        script = self.folder / "job.py"
+        script.write_text("print('hi')")
+        self.client._copy_file(str(script), "root@example:/pod/input/worker.py")
+        self.assertEqual((self.pod / "input" / "worker.py").read_text(), "print('hi')")
+        self.assertNotIn("scp", self.calls())
+
+    def test_download_comes_back_through_cat_and_checks_the_size(self):
+        (self.pod / "result.ply").write_bytes(b"ply\n" + os.urandom(2 * 1024 ** 2))
+        local = self.folder / "result.ply.part"
+        self.client._scp_with_progress(["root@example:/pod/result.ply"], str(local),
+                                       self.logs.append, "result.ply download")
+        self.assertEqual(local.read_bytes(), (self.pod / "result.ply").read_bytes())
+        self.assertTrue(any("100%" in line for line in self.logs))
+
+    def test_failures_report_the_pods_reason(self):
+        photo = self.folder / "photo.jpg"
+        photo.write_bytes(b"photo")
+        with self.assertRaisesRegex(TransferError, "Photo batch upload failed: .*missing"):
+            self.client._upload_batch([photo], None, destination="root@example:/pod/missing/")
+        with self.assertRaisesRegex(TransferError, "download failed: .*No such file"):
+            self.client._scp_with_progress(["root@example:/pod/nothing.ply"],
+                                           str(self.folder / "x"), None, "nothing.ply download")
 
 
 if __name__ == "__main__":

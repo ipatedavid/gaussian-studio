@@ -136,7 +136,7 @@ class FakeDrive:
 class JobFlowTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        root = Path(self.tmp.name)
+        root = Path(self.tmp.name).resolve()  # Windows hands out short names (RUNNER~1)
         key = root / "id_ed25519"
         key.write_text("private")
         Path(str(key) + ".pub").write_text("ssh-ed25519 AAAA test")

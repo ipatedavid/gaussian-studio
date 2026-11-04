@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import struct
 import sys
 import tempfile
@@ -185,6 +186,7 @@ class SpirulaOptionTests(unittest.TestCase):
         self.assertEqual(self.flag(train, "--load-normals"), "0")
 
 
+    @unittest.skipIf(os.name == "nt", "pod-side code: pods run Linux")
     def test_people_masks_run_after_the_solve(self):
         train, _, _, _ = self.run_spirula(people_masks=True)
         self.assertEqual(len(self.masking), 1)

@@ -1,4 +1,6 @@
 # Test-only dependencies (the app itself does not need these).
 pillow
+# A small SSH server for test_real_ssh.py.
+paramiko
 numpy
 opencv-python-headless

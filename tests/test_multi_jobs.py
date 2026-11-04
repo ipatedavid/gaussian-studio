@@ -33,6 +33,7 @@ class ManagerTestCase(unittest.TestCase):
 
     def tearDown(self):
         self.release.set()
+        self.manager.history.close()  # Windows can't delete an open file
         self.tmp.cleanup()
 
     def start(self, title="job"):

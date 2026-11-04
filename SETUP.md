@@ -5,13 +5,15 @@ Gaussian Studio turns photos, videos, or both into a Gaussian splat. It rents a 
 downloads the result to your computer. The GPU is shut down when the job ends, so you only pay
 while a job runs (usually well under a dollar or two for a scene).
 
-It runs on **Linux** (Ubuntu or similar) and **macOS**.
+It runs on **Linux** (Ubuntu or similar), **macOS** and **Windows** 10 or 11.
 
 Setup takes about 15 minutes:
 
-1. [Install the app](#1-install-the-app)
+1. [Install the app](#1-install-the-app) ([Windows](#on-windows))
 2. [Set up RunPod](#2-set-up-runpod)
 3. [Optional: Google Drive](#3-optional-google-drive)
+
+To remove it later, see [Uninstalling](#uninstalling).
 
 ---
 
@@ -66,6 +68,27 @@ git pull
 
 Your keys and settings are kept.
 
+### On Windows
+
+1. Download the app: on the [GitHub page](https://github.com/ipatedavid/gaussian-studio), click
+   **Code → Download ZIP**, then right-click the ZIP → **Extract All** and put the folder
+   somewhere permanent, such as your Documents. (If you use git: `git clone
+   https://github.com/ipatedavid/gaussian-studio.git`.)
+2. Open the folder and double-click **install.cmd**. If Windows asks whether to run it, choose
+   **Run** (or **More info → Run anyway**).
+
+The installer does the same as on Linux and macOS. If Python is missing, it offers to install it
+for you. It adds **Gaussian Studio** to the Start menu and the desktop. The SSH key goes in
+`C:\Users\<you>\.ssh\id_ed25519`, and the line to paste into RunPod is already on your
+clipboard.
+
+For videos, also install ffmpeg: open **Terminal** (or PowerShell) and run
+`winget install -e --id Gyan.FFmpeg`. Photos work without it.
+
+**Updating on Windows:** download the ZIP again, extract it over the old folder (your keys and
+settings are kept, since they aren't in the ZIP), then double-click **install.cmd** again. With
+git, `git pull` and run **install.cmd**.
+
 ---
 
 ## 2. Set up RunPod
@@ -80,6 +103,8 @@ Your keys and settings are kept.
    cat ~/.ssh/id_ed25519.pub
    ```
 
+   On Windows, in PowerShell: `Get-Content ~\.ssh\id_ed25519.pub`
+
    If other keys are already in that box, put yours on a new line below them.
 3. **Create an API key.** Still in **Settings**, go to **API Keys → Create API Key**. Give it
    a name like *Gaussian Studio*, choose **All** permissions, and copy the key. RunPod only
@@ -87,8 +112,8 @@ Your keys and settings are kept.
 4. **Paste it into the app.** Open Gaussian Studio → **Settings** → **Connection** → paste it
    in **RunPod API key** → **Save**.
 
-The key is saved in `desktop/.env` inside the app folder, readable only by your user. Don't
-share that file. Anyone with the key can spend your RunPod credit.
+The key is saved in `desktop/.env` inside the app folder (on Linux and macOS, readable only by
+your user). Don't share that file. Anyone with the key can spend your RunPod credit.
 
 You're ready: on **New job**, choose **Local** and press **Choose folder**. The app lists the
 folder's photos and videos with ticks; untick anything to leave out. Photos and videos together
@@ -161,11 +186,38 @@ local folder.
 
 ---
 
+## Uninstalling
+
+Run the uninstaller from the app's folder: double-click **uninstall.cmd** on Windows, or on
+Linux and macOS:
+
+```bash
+cd gaussian-studio
+./uninstall.sh
+```
+
+It removes the shortcuts, the app's Python packages, your saved RunPod key and settings, and the
+app folder. Before that, it:
+
+- stops if a GPU may still be running, so you can stop it first (RunPod bills it until then);
+- moves your finished splats out of the app folder, to `Gaussian Studio results` in your home
+  folder (on Windows, in Documents), unless you choose to delete them. Results you saved
+  elsewhere stay where they are;
+- asks whether to delete the SSH key, only if the installer made it. Keep it if you use it for
+  anything else.
+
+Python, ffmpeg and git stay installed. Afterwards, you can also delete your API key and SSH key
+on RunPod's **Settings** page, and the Drive service account in Google Cloud Console.
+
+---
+
 ## Troubleshooting
 
 | Problem | Fix |
 | --- | --- |
 | The app doesn't open on Linux | Run `sudo apt install libxcb-cursor0`, or start it from a terminal to see the error: `cd gaussian-studio/desktop && .venv/bin/python main.py` |
+| The app doesn't open on Windows | Look in `desktop\logs\app.log` inside the app folder for the error |
+| Windows says OpenSSH Client is missing | **Settings → System → Optional features → View features**, add **OpenSSH Client**, then run **install.cmd** again |
 | "Set up credentials" stays at the top | Check the RunPod key in **Settings**, and that both `~/.ssh/id_ed25519` and `~/.ssh/id_ed25519.pub` exist |
 | No GPUs available | Raise the max price or lower the minimum VRAM, or try again later; stock changes all the time |
 | The job fails while connecting | Make sure your public key is in RunPod's **SSH Public Keys** box. In **Settings → Pods & cost**, choose **Secure Cloud only** |

@@ -15,6 +15,7 @@ from pathlib import Path
 
 import requests
 
+from os_support import HIDDEN
 from storage import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, probe_output
 
 DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
@@ -328,7 +329,7 @@ class DriveClient:
                     "stream=width,height,avg_frame_rate,r_frame_rate,duration:format=duration",
                     "-of", "json", url,
                 ],
-                capture_output=True, text=True, timeout=timeout,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, **HIDDEN,
             )
             info = probe_output(result.stdout) if result.returncode == 0 else None
         except (OSError, ValueError, subprocess.TimeoutExpired, DriveError):

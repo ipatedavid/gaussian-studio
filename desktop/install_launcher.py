@@ -5,7 +5,8 @@ Remove:    python3 install_launcher.py --remove
 
 Linux: writes ~/.local/share/applications/gaussian-studio.desktop and a copy on
 the desktop. macOS: builds ~/Applications/Gaussian Studio.app and puts an alias
-to it on the desktop. Both start the app with this Python and this folder.
+to it on the desktop. Windows: adds a Gaussian Studio shortcut to the Start menu
+and the desktop. All start the app with this Python and this folder.
 """
 from __future__ import annotations
 
@@ -24,6 +25,17 @@ DESKTOP_ID = "gaussian-studio"
 ENTRY = Path.home() / ".local" / "share" / "applications" / f"{DESKTOP_ID}.desktop"
 MAC_APP = Path.home() / "Applications" / "Gaussian Studio.app"
 MAC = sys.platform == "darwin"
+WINDOWS = sys.platform == "win32"
+WINDOWS_ICON = APP_DIR / "assets" / "gaussian-studio.ico"
+WINDOWS_LINK = "Gaussian Studio.lnk"
+# Writes a .lnk through the Windows shell; the values come in environment variables
+# so no path ever needs quoting.
+SHORTCUT_SCRIPT = (
+    "$s = (New-Object -ComObject WScript.Shell).CreateShortcut($env:GS_LINK); "
+    "$s.TargetPath = $env:GS_TARGET; $s.Arguments = $env:GS_ARGS; "
+    "$s.WorkingDirectory = $env:GS_DIR; $s.IconLocation = $env:GS_ICON; "
+    "$s.Description = 'Turn photos and videos into Gaussian splats on RunPod GPUs'; $s.Save()"
+)
 
 
 def desktop_dir() -> Path:
@@ -82,10 +94,23 @@ def desktop_quote(value: str) -> str:
     return f'"{escaped}"'
 
 
+def quiet_run(command: list[str]) -> None:
+    """A helper some desktops have and others don't."""
+    try:
+        subprocess.run(command, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+
+
 def install() -> None:
     sys.path.insert(0, str(APP_DIR))
     draw_icon(ICON)
-    install_mac() if MAC else install_linux()
+    if WINDOWS:
+        install_windows()
+    elif MAC:
+        install_mac()
+    else:
+        install_linux()
 
 
 def install_linux() -> None:
@@ -106,15 +131,13 @@ def install_linux() -> None:
         encoding="utf-8",
     )
     ENTRY.chmod(0o755)
-    subprocess.run(["update-desktop-database", str(ENTRY.parent)], check=False,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    quiet_run(["update-desktop-database", str(ENTRY.parent)])
     print(f"Installed {ENTRY}")
     shortcut = desktop_dir() / ENTRY.name
     if shortcut.parent.is_dir():
         shutil.copy2(ENTRY, shortcut)
         # GNOME only starts desktop launchers it has been told to trust.
-        subprocess.run(["gio", "set", str(shortcut), "metadata::trusted", "true"], check=False,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        quiet_run(["gio", "set", str(shortcut), "metadata::trusted", "true"])
         print(f"Added {shortcut}")
     print("Open the app grid, search 'Gaussian Studio', then right-click it and pin it to the dock.")
 
@@ -158,6 +181,42 @@ def install_mac() -> None:
           "Dock icon while it runs → Options → Keep in Dock.")
 
 
+def windows_folders() -> list[Path]:
+    """The Start menu's Programs folder and the desktop (which OneDrive may have moved)."""
+    import ctypes
+
+    folders = []
+    for csidl in (0x02, 0x10):  # CSIDL_PROGRAMS, CSIDL_DESKTOPDIRECTORY
+        buffer = ctypes.create_unicode_buffer(260)
+        if ctypes.windll.shell32.SHGetFolderPathW(None, csidl, None, 0, buffer) == 0:
+            folders.append(Path(buffer.value))
+    return folders
+
+
+def install_windows() -> None:
+    from PySide6 import QtGui
+
+    has_icon = QtGui.QImage(str(ICON)).save(str(WINDOWS_ICON))
+    # pythonw starts the app without a console window; -X utf8 reads and writes
+    # files as UTF-8, as on Linux and macOS.
+    pythonw = Path(sys.executable).with_name("pythonw.exe")
+    for folder in windows_folders():
+        link = folder / WINDOWS_LINK
+        env = {**os.environ, "GS_LINK": str(link),
+               "GS_TARGET": str(pythonw if pythonw.is_file() else sys.executable),
+               "GS_ARGS": f'-X utf8 "{APP_DIR / "main.py"}"', "GS_DIR": str(APP_DIR),
+               "GS_ICON": str(WINDOWS_ICON) if has_icon else ""}
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", SHORTCUT_SCRIPT],
+            env=env, capture_output=True, text=True, check=False,
+        )
+        if result.returncode:
+            print(f"Could not add {link}: {result.stderr.strip()}")
+        else:
+            print(f"Added {link}")
+    print("Open it from the Start menu or the desktop. To pin it, right-click it > Pin to taskbar.")
+
+
 def make_icns(png: Path, target: Path) -> bool:
     """Convert the icon with macOS's own sips and iconutil."""
     try:
@@ -186,6 +245,11 @@ def _make_icns(png: Path, target: Path) -> bool:
 
 
 def remove() -> None:
+    if WINDOWS:
+        for folder in windows_folders():
+            (folder / WINDOWS_LINK).unlink(missing_ok=True)
+            print(f"Removed {folder / WINDOWS_LINK}")
+        return
     if MAC:
         shutil.rmtree(MAC_APP, ignore_errors=True)
         alias = desktop_dir() / "Gaussian Studio"

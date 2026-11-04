@@ -66,6 +66,7 @@ class PlanTests(unittest.TestCase):
             plan_drive_mixed("f1", "Room", (), (), Path("/r"), 0, 1, 3.0)
 
 
+@unittest.skipIf(os.name == "nt", "pod-side code: pods run Linux")
 class PodStagingTests(unittest.TestCase):
     def run_spirula(self, photos: int, videos: list[str], *, fisheye=False):
         """Run the real _run_spirula on a mixed input with a fake binary."""

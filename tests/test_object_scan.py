@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import struct
 import sys
 import tempfile
@@ -64,6 +65,7 @@ class MaskTests(unittest.TestCase):
         self.assertEqual(masks, {"IMG_0002.png": "0", "IMG_0010.png": "1"})
         self.assertEqual(commands[0][1:5], ["sam", "track", "--model", str(pipeline.BIREFNET_CACHE)])
 
+    @unittest.skipIf(os.name == "nt", "pod-side code: pods run Linux")
     def test_video_subfolders_get_their_own_masks(self):
         written, masks, commands = self.run_masks(
             {"v1": ["00000.png", "00001.png"], "v2": ["00000.png"]})
@@ -202,6 +204,7 @@ class MainSceneTrainTests(options.SpirulaOptionTests):
                             _write_main_scene_region=lambda dataset: "box around the scene"):
             return super().run_spirula(**kwargs)
 
+    @unittest.skipIf(os.name == "nt", "pod-side code: pods run Linux")
     def test_region_is_named_to_the_trainer(self):
         train, _, _, _ = self.run_spirula(main_scene=True)
         self.assertTrue(self.flag(train, "--roi-region").endswith("roi/main-scene.json"))

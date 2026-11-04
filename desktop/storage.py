@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 
+from os_support import HIDDEN
+
 GIB = 1024 ** 3
 MIB = 1024 ** 2
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff", ".bmp"}
@@ -287,7 +289,7 @@ def probe_video(video: Path) -> VideoInfo:
                 "-show_entries", "stream=width,height,avg_frame_rate,r_frame_rate,duration:format=duration",
                 "-of", "json", str(video),
             ],
-            capture_output=True, text=True, timeout=20, check=True,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20, check=True, **HIDDEN,
         )
     except FileNotFoundError as exc:
         raise ValueError("ffprobe is required on this laptop to inspect video metadata.") from exc

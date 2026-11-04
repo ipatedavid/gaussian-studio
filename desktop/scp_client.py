@@ -3,20 +3,19 @@ from __future__ import annotations
 import codecs
 import concurrent.futures
 import errno
-import fcntl
 import hashlib
 import json
 import os
-import pty
+import posixpath
+import queue
 import re
 import select
-import selectors
 import shlex
 import socket
 import struct
 import subprocess
+import tarfile
 import tempfile
-import termios
 import threading
 import time
 import zipfile
@@ -24,6 +23,12 @@ from pathlib import Path
 from typing import Callable
 
 from config import EXTRA_WORKER_SCRIPTS, GUIDANCE_LEVELS
+from os_support import HIDDEN, WINDOWS
+
+if not WINDOWS:  # scp's progress meter needs a terminal, which only Unix can fake
+    import fcntl
+    import pty
+    import termios
 
 
 class TransferError(RuntimeError):
@@ -72,6 +77,12 @@ class Tunnel:
                 self.process.wait()
 
 
+def _ssh_path(path: Path) -> str:
+    """A path as an ssh -o value: forward slashes, quoted if it has spaces (Windows user names)."""
+    text = path.as_posix()
+    return f'"{text}"' if " " in text else text
+
+
 def _free_local_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
         probe.bind(("127.0.0.1", 0))
@@ -101,35 +112,88 @@ def _stream_output(
             log(line)
             last_log = time.monotonic()
 
-    with selectors.DefaultSelector() as selector:
-        selector.register(process.stdout, selectors.EVENT_READ)
-        while selector.get_map():
-            for _key, _events in selector.select(
-                timeout=min(1, max(0.01, heartbeat_seconds / 2))
-            ):
-                chunk = os.read(process.stdout.fileno(), 65536)
-                if not chunk:
-                    pending += decoder.decode(b"", final=True)
-                    emit(pending)
-                    selector.unregister(process.stdout)
-                    break
-                last_data = time.monotonic()
-                pending += decoder.decode(chunk)
-                # CLIs often redraw progress with CR instead of printing LF.
-                parts = re.split(r"[\r\n]", pending)
-                pending = parts.pop()
-                for part in parts:
-                    emit(part)
-                if len(pending) >= 8192:
-                    emit(pending)
-                    pending = ""
-            now = time.monotonic()
-            if pending and now - last_data >= 2:
+    # A thread reads the pipe, since Windows can't wait on pipes with select().
+    chunks: queue.Queue[bytes | None] = queue.Queue()
+    threading.Thread(target=_read_chunks, args=(process.stdout, chunks), daemon=True).start()
+    while True:
+        try:
+            chunk = chunks.get(timeout=min(1, max(0.01, heartbeat_seconds / 2)))
+        except queue.Empty:
+            chunk = b""
+        if chunk is None:
+            pending += decoder.decode(b"", final=True)
+            emit(pending)
+            break
+        if chunk:
+            last_data = time.monotonic()
+            pending += decoder.decode(chunk)
+            # CLIs often redraw progress with CR instead of printing LF.
+            parts = re.split(r"[\r\n]", pending)
+            pending = parts.pop()
+            for part in parts:
+                emit(part)
+            if len(pending) >= 8192:
                 emit(pending)
                 pending = ""
-            if selector.get_map() and now - last_log >= heartbeat_seconds:
-                log("Processing is still running; waiting for the next tool update.")
-                last_log = now
+        now = time.monotonic()
+        if pending and now - last_data >= 2:
+            emit(pending)
+            pending = ""
+        if now - last_log >= heartbeat_seconds:
+            log("Processing is still running; waiting for the next tool update.")
+            last_log = now
+
+
+def _read_chunks(stream, chunks: queue.Queue) -> None:
+    """Pass a pipe's output on as it arrives; None marks the end."""
+    try:
+        for chunk in iter(lambda: os.read(stream.fileno(), 65536), b""):
+            chunks.put(chunk)
+    except (OSError, ValueError):  # closed under us
+        pass
+    chunks.put(None)
+
+
+class _Meter:
+    """Logs a transfer's progress like scp's own meter: percent, size, speed and ETA."""
+
+    def __init__(self, label: str, total: int | None, log: Callable[[str], None] | None):
+        self.label, self.total, self.log = label, total, log
+        self.done = 0
+        self.started = self.last = time.monotonic()
+
+    def add(self, count: int) -> None:
+        self.done += count
+        if self.log and time.monotonic() - self.last >= 3:
+            self.report()
+
+    def report(self) -> None:
+        now = time.monotonic()
+        self.last = now
+        rate = self.done / max(now - self.started, 0.001)
+        size = f"{self.done / 1024**2:.1f} MiB"
+        if self.total:
+            done = min(self.done, self.total)
+            eta = (self.total - done) / rate if rate > 0 else 0
+            size = (f"{done * 100 // self.total}%  {done / 1024**2:.1f} / "
+                    f"{self.total / 1024**2:.1f} MiB")
+            size += f"  {rate / 1024**2:.2f} MiB/s  ETA {int(eta) // 60:02d}:{int(eta) % 60:02d}"
+        else:
+            size += f"  {rate / 1024**2:.2f} MiB/s"
+        if self.log:
+            self.log(f"[SCP] {self.label}  {size}")
+
+
+class _CountingWriter:
+    """A write-only file that passes bytes on and counts them."""
+
+    def __init__(self, target, count: Callable[[int], None]):
+        self.target, self.count = target, count
+
+    def write(self, data: bytes) -> int:
+        self.target.write(data)
+        self.count(len(data))
+        return len(data)
 
 
 def _describe_ssh_failure(returncode: int, stderr: str) -> str:
@@ -173,8 +237,8 @@ class ScpClient:
             "-i", str(private_key), "-o", "BatchMode=yes",
             "-o", "IdentitiesOnly=yes",
             "-o", "StrictHostKeyChecking=accept-new",
-            "-o", f"UserKnownHostsFile={known_hosts}",
-            "-o", "GlobalKnownHostsFile=/dev/null",
+            "-o", f"UserKnownHostsFile={_ssh_path(known_hosts)}",
+            "-o", f"GlobalKnownHostsFile={os.devnull}",
             "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=30",
             "-o", "ServerAliveCountMax=3",
         ]
@@ -182,7 +246,7 @@ class ScpClient:
     def _ssh(self, command: str, timeout: int = 30) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             ["ssh", *self.options, "-p", str(self.port), f"root@{self.host}", command],
-            capture_output=True, text=True, timeout=timeout,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, **HIDDEN
         )
 
     def gpu_power(self) -> list[dict] | None:
@@ -215,7 +279,7 @@ class ScpClient:
             result = subprocess.run(
                 ["ssh", *self.options, "-vv", "-n", "-p", str(self.port),
                  f"root@{self.host}", "true"],
-                capture_output=True, text=True, timeout=45,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=45, **HIDDEN
             )
         except subprocess.TimeoutExpired:
             return "the verbose probe timed out"
@@ -319,7 +383,7 @@ class ScpClient:
              "-o", "ExitOnForwardFailure=yes",
              "-L", f"127.0.0.1:{local_port}:127.0.0.1:{remote_port}",
              "-p", str(self.port), f"root@{self.host}"],
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **HIDDEN
         )
         return Tunnel(process, local_port)
 
@@ -392,7 +456,7 @@ print(json.dumps({
         with subprocess.Popen(
             ["ssh", *self.options, "-n", "-p", str(self.port), f"root@{self.host}",
              f"tail -n {int(lines)} -F {REMOTE_JOB_LOG}"],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, **HIDDEN
         ) as process:
             def end_on_stop():
                 stop.wait()
@@ -465,9 +529,12 @@ print('finished from', ply)
         log: Callable[[str], None] | None = None,
         progress: str = "Transfer",
     ) -> None:
+        if WINDOWS:
+            self._pipe_transfer([source], destination, log, progress)
+            return
         with subprocess.Popen(
             ["scp", *self.options, "-P", str(self.port), source, destination],
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", **HIDDEN
         ) as process:
             while True:
                 try:
@@ -512,6 +579,9 @@ print('finished from', ply)
         log: Callable[[str], None] | None, label: str,
     ) -> None:
         """Run one SCP transfer (either direction) and log its progress meter."""
+        if WINDOWS:
+            self._pipe_transfer(sources, destination, log, label)
+            return
         master, slave = pty.openpty()
         process = None
         try:
@@ -519,7 +589,7 @@ print('finished from', ply)
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 160, 0, 0))
             process = subprocess.Popen(
                 ["scp", *self.options, "-P", str(self.port), *sources, destination],
-                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=slave,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=slave, **HIDDEN
             )
             os.close(slave)
             slave = -1
@@ -583,6 +653,103 @@ print('finished from', ply)
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait()
+
+    # ---- Windows: transfers through plain ssh -------------------------------
+    # scp prints its progress meter only to a terminal, which Windows can't fake
+    # for a hidden process. Uploads go as one tar stream into `tar -x` on the pod
+    # and downloads come back through `cat`; the bytes are counted here instead.
+
+    def _pipe_transfer(
+        self, sources: list[str], destination: str,
+        log: Callable[[str], None] | None, label: str,
+    ) -> None:
+        pod = f"root@{self.host}:"
+        if destination.startswith(pod):
+            self._pipe_upload([Path(source) for source in sources],
+                              destination[len(pod):], log, label)
+        elif len(sources) == 1 and sources[0].startswith(pod):
+            self._pipe_download(sources[0][len(pod):], Path(destination), log, label)
+        else:
+            raise TransferError(f"{label} failed: copies run between this computer and the pod")
+
+    def _pipe_upload(
+        self, files: list[Path], remote: str,
+        log: Callable[[str], None] | None, label: str,
+    ) -> None:
+        """Send files into a folder on the pod (remote ends in /), or one file to a remote path."""
+        if remote.endswith("/"):
+            folder, names = remote.rstrip("/") or "/", [file.name for file in files]
+        elif len(files) == 1:
+            folder, name = posixpath.split(remote)
+            names = [name]
+        else:
+            raise TransferError(f"{label} failed: several files need a folder to go into")
+        meter = _Meter(label, sum(file.stat().st_size for file in files), log)
+        process = subprocess.Popen(
+            ["ssh", *self.options, "-p", str(self.port), f"root@{self.host}",
+             f"tar -x -f - --no-same-owner -C {shlex.quote(folder)}"],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, **HIDDEN,
+        )
+        errors: list[bytes] = []
+        drain = threading.Thread(target=lambda: errors.append(process.stderr.read()), daemon=True)
+        drain.start()
+        broken = False
+        try:
+            with tarfile.open(fileobj=_CountingWriter(process.stdin, meter.add), mode="w|") as tar:
+                for file, name in zip(files, names):
+                    tar.add(str(file), arcname=name, recursive=False)
+            process.stdin.close()
+        except (BrokenPipeError, OSError):  # ssh ended early; its stderr says why
+            broken = True
+        except BaseException:
+            process.kill()
+            raise
+        finally:
+            if broken or process.poll() is None:
+                try:
+                    process.wait(timeout=None if not broken else 30)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+        drain.join(timeout=5)
+        process.stderr.close()
+        if process.returncode or broken:
+            detail = b"".join(errors).decode("utf-8", "replace").strip().splitlines()
+            raise TransferError(
+                f"{label} failed: " + ("; ".join(detail[-3:]) or f"exit code {process.returncode}")
+            )
+        meter.report()
+
+    def _pipe_download(
+        self, remote: str, local: Path, log: Callable[[str], None] | None, label: str,
+    ) -> None:
+        """Fetch one pod file to a local path."""
+        quoted = shlex.quote(remote)
+        try:
+            sized = self._ssh(f"stat -c %s {quoted}", timeout=60)
+            size = int(sized.stdout.strip()) if sized.returncode == 0 else None
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            size = None
+        meter = _Meter(label, size, log)
+        with subprocess.Popen(
+            ["ssh", *self.options, "-n", "-p", str(self.port), f"root@{self.host}", f"cat {quoted}"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, **HIDDEN,
+        ) as process:
+            try:
+                with local.open("wb") as out:
+                    for chunk in iter(lambda: process.stdout.read(1024 ** 2), b""):
+                        out.write(chunk)
+                        meter.add(len(chunk))
+            except BaseException:
+                process.kill()
+                raise
+            stderr = process.stderr.read().decode("utf-8", "replace").strip().splitlines()
+            if process.wait() or (size is not None and meter.done != size):
+                raise TransferError(
+                    f"{label} failed: " + ("; ".join(stderr[-3:])
+                                           or f"got {meter.done} of {size} bytes")
+                )
+        meter.report()
 
     def _verify_uploaded_images(self, expected: dict[str, int]) -> None:
         script = (
@@ -751,7 +918,7 @@ print('finished from', ply)
         with subprocess.Popen(
             ["ssh", *self.options, "-tt", "-n", "-p", str(self.port),
              f"root@{self.host}", command],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **HIDDEN
         ) as process:
             _stream_output(process, log)
             if process.wait():
@@ -842,7 +1009,7 @@ print('finished from', ply)
         with subprocess.Popen(
             ["ssh", *self.options, "-tt", "-n", "-p", str(self.port),
              f"root@{self.host}", command],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **HIDDEN
         ) as process:
             _stream_output(process, log)
             if process.wait() == SSH_CONNECTION_LOST:
@@ -975,7 +1142,7 @@ print('finished from', ply)
                 )
                 process = subprocess.Popen(
                     ["ssh", *self.options, "-p", str(self.port), f"root@{self.host}", command],
-                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **HIDDEN
                 )
                 before = done
                 try:

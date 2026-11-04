@@ -128,6 +128,7 @@ def colmap_model(model: Path, cameras: dict[int, float], images: list[tuple[str,
     (model / "images.bin").write_bytes(data)
 
 
+@unittest.skipIf(os.name == "nt", "pod-side code: pods run Linux")
 class PodStagingTests(unittest.TestCase):
     def run_spirula(self, groups: dict[str, str] | None, *, fisheye=True):
         commands: list[list[str]] = []
