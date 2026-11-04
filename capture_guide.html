@@ -174,6 +174,30 @@ td .n { font-family: var(--mono); color: var(--tape); margin-right: 6px; }
 .r-label { fill: var(--ink); font: 600 17px var(--body); }
 .r-label.muted { fill: var(--muted); font-weight: 400; }
 
+/* Large rooms: plan and ladder diagrams */
+.big-figs { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 20px; align-items: start; }
+@media (max-width: 860px) { .big-figs { grid-template-columns: 1fr; } }
+.big-figs figure { margin: 0; display: grid; gap: 8px; }
+.big-figs svg { width: 100%; height: auto; display: block; background: var(--sheet); border: 1px solid var(--rule); }
+.lr-wall { fill: none; stroke: var(--ink); stroke-width: 3; }
+.lr-piece { fill: var(--furniture); stroke: var(--muted); stroke-width: 1.5; }
+.lr-pass { fill: none; stroke-width: 2.5; stroke-dasharray: 7 6; }
+.lr-pass.p1 { stroke: var(--seen); }
+.lr-pass.p2 { stroke: var(--partial); }
+.lr-pass.p3 { stroke: var(--tape); stroke-dasharray: none; }
+.lr-cam circle { stroke: none; }
+.lr-cam line { stroke-width: 1.5; stroke-dasharray: 3 4; }
+.lr-cam.p1 circle { fill: var(--seen); } .lr-cam.p1 line { stroke: var(--seen); }
+.lr-cam.p2 circle { fill: var(--partial); } .lr-cam.p2 line { stroke: var(--partial); }
+.lr-cam.p3 circle { fill: var(--tape); } .lr-cam.p3 line { stroke: var(--tape); }
+.lr-cam.p4 circle { fill: var(--solid); } .lr-cam.p4 line { stroke: var(--solid); }
+.lr-label { fill: var(--ink); font: 600 15px var(--body); }
+.lr-label.muted { fill: var(--muted); font-weight: 400; }
+.lr-num { fill: var(--paper); font: 700 13px var(--mono); }
+.lr-badge { stroke: none; }
+.lr-bad { stroke: var(--tape); stroke-width: 3; fill: none; }
+.lr-good { stroke: var(--solid); stroke-width: 3; fill: none; }
+
 /* Checklist and notes */
 .two { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 32px; }
 .check { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; }
@@ -330,6 +354,216 @@ footer { border-top: 2px solid var(--ink); padding-top: 18px; color: var(--muted
       <div><h3>Glass, mirrors, shiny floors</h3><p>Reflections move as you move, so they look like geometry that isn't there. Keep plenty of normal surfaces in frame and don't linger on them.</p></div>
       <div><h3>Pace</h3><p>About one slow step per second. If a paused frame from your video looks smeared, you moved too fast for the light.</p></div>
     </div>
+  </div>
+</section>
+
+<section aria-labelledby="big">
+  <div style="display:grid;gap:8px">
+    <span class="label">Fuji photos · fisheye · galleries, halls, museum rooms</span>
+    <h2 id="big">Large rooms, with close-up detail</h2>
+  </div>
+  <p class="lede">The camera solver places a photo by recognising detail it shares with photos it has already placed. Big rooms break when you jump: a wall first seen from across the room, then shot from a metre away with your back to where you were. Nothing links the two, so those photos either go missing or get glued on in the wrong place, which shows as doubled windows and ghost frames.</p>
+  <div class="big-figs">
+    <figure>
+      <svg viewBox="0 0 760 520" role="img" aria-labelledby="big-plan-title">
+        <title id="big-plan-title">Top-down plan of a 12 by 8 metre room with a centre piece. Pass 1 laps the walls about a metre in, looking across. Pass 2 is an inner ring about three metres from the walls, looking out. Pass 3 steps in to the right wall at four, two, one and half a metre, sweeps along it, and steps back out. Pass 4 orbits the centre piece.</title>
+        <rect class="lr-wall" x="40" y="40" width="660" height="440"/>
+        <ellipse class="lr-piece" cx="370" cy="260" rx="80" ry="34"/>
+        <text class="lr-label muted" x="370" y="265" text-anchor="middle">Centre piece</text>
+        <!-- 1: outer lap, ~1 m in, looking across -->
+        <rect class="lr-pass p1" x="95" y="95" width="550" height="330" rx="40"/>
+        <g class="lr-cam p1"><circle cx="200" cy="425" r="6"/><line x1="200" y1="425" x2="290" y2="160"/></g>
+        <g class="lr-cam p1"><circle cx="370" cy="425" r="6"/><line x1="370" y1="425" x2="420" y2="150"/></g>
+        <g class="lr-cam p1"><circle cx="540" cy="425" r="6"/><line x1="540" y1="425" x2="520" y2="140"/></g>
+        <g class="lr-cam p1"><circle cx="95" cy="200" r="6"/><line x1="95" y1="200" x2="400" y2="190"/></g>
+        <!-- 2: inner ring, ~3 m from the walls, looking out -->
+        <rect class="lr-pass p2" x="205" y="165" width="330" height="190" rx="50"/>
+        <g class="lr-cam p2"><circle cx="300" cy="165" r="6"/><line x1="300" y1="165" x2="290" y2="48"/></g>
+        <g class="lr-cam p2"><circle cx="205" cy="290" r="6"/><line x1="205" y1="290" x2="48" y2="320"/></g>
+        <g class="lr-cam p2"><circle cx="420" cy="355" r="6"/><line x1="420" y1="355" x2="440" y2="472"/></g>
+        <!-- 3: ladder in to the right wall, sweep along it, back out -->
+        <path class="lr-pass p3" d="M535 200 L645 200 L672 200 L672 330 L645 330 L535 330"/>
+        <g class="lr-cam p3"><circle cx="535" cy="200" r="6"/><line x1="535" y1="200" x2="696" y2="200"/></g>
+        <g class="lr-cam p3"><circle cx="590" cy="200" r="6"/></g>
+        <g class="lr-cam p3"><circle cx="645" cy="200" r="6"/></g>
+        <g class="lr-cam p3"><circle cx="672" cy="230" r="6"/><line x1="672" y1="230" x2="696" y2="230"/></g>
+        <g class="lr-cam p3"><circle cx="672" cy="265" r="6"/><line x1="672" y1="265" x2="696" y2="265"/></g>
+        <g class="lr-cam p3"><circle cx="672" cy="300" r="6"/><line x1="672" y1="300" x2="696" y2="300"/></g>
+        <text class="lr-label" x="692" y="186" text-anchor="end">ring · 2 · 1 · 0.5 m</text>
+        <text class="lr-label muted" x="692" y="352" text-anchor="end">back out the same way</text>
+        <!-- 4: orbit of the centre piece -->
+        <ellipse class="lr-pass" style="stroke: var(--solid)" cx="370" cy="260" rx="125" ry="62"/>
+        <g class="lr-cam p4"><circle cx="370" cy="198" r="6"/><line x1="370" y1="198" x2="370" y2="228"/></g>
+        <g class="lr-cam p4"><circle cx="495" cy="260" r="6"/><line x1="495" y1="260" x2="452" y2="260"/></g>
+        <!-- pass numbers -->
+        <g><circle class="lr-badge" cx="95" cy="70" r="12" fill="var(--seen)"/><text class="lr-num" x="95" y="75" text-anchor="middle">1</text></g>
+        <g><circle class="lr-badge" cx="205" cy="140" r="12" fill="var(--partial)"/><text class="lr-num" x="205" y="145" text-anchor="middle">2</text></g>
+        <g><circle class="lr-badge" cx="590" cy="232" r="12" fill="var(--tape)"/><text class="lr-num" x="590" y="237" text-anchor="middle">3</text></g>
+        <g><circle class="lr-badge" cx="370" cy="345" r="12" fill="var(--solid)"/><text class="lr-num" x="370" y="350" text-anchor="middle">4</text></g>
+        <text class="lr-label muted" x="370" y="506" text-anchor="middle">12 × 8 m room · one continuous walk · numbers are the order</text>
+      </svg>
+      <figcaption class="label">Plan · 1 outer lap · 2 inner ring looking out · 3 ladder in, sweep, back out · 4 orbit</figcaption>
+    </figure>
+    <figure>
+      <svg viewBox="0 0 400 520" role="img" aria-labelledby="big-ladder-title">
+        <title id="big-ladder-title">Side by side: a jump from eleven metres to one metre from a wall, marked as failing, against a ladder of four steps, each half the distance of the last, marked as working.</title>
+        <line x1="200" y1="24" x2="200" y2="496" stroke="var(--rule)" stroke-width="1"/>
+        <!-- wall at the top of both halves -->
+        <line class="lr-wall" x1="24" y1="40" x2="176" y2="40"/>
+        <line class="lr-wall" x1="224" y1="40" x2="376" y2="40"/>
+        <!-- jump -->
+        <g class="lr-cam p1"><circle cx="100" cy="440" r="7"/><line x1="100" y1="440" x2="100" y2="46"/></g>
+        <g class="lr-cam p3"><circle cx="100" cy="80" r="7"/></g>
+        <path class="lr-bad" d="M88 220 L112 244 M112 220 L88 244"/>
+        <text class="lr-label" x="100" y="472" text-anchor="middle">11 m away</text>
+        <text class="lr-label" x="122" y="86">1 m</text>
+        <text class="lr-label" x="100" y="290" text-anchor="middle">×11 closer,</text>
+        <text class="lr-label" x="100" y="310" text-anchor="middle">nothing between</text>
+        <!-- ladder -->
+        <g class="lr-cam p3"><circle cx="300" cy="260" r="7"/><line x1="300" y1="260" x2="300" y2="46"/></g>
+        <g class="lr-cam p3"><circle cx="300" cy="150" r="7"/></g>
+        <g class="lr-cam p3"><circle cx="300" cy="95" r="7"/></g>
+        <g class="lr-cam p3"><circle cx="300" cy="68" r="7"/></g>
+        <text class="lr-label" x="318" y="265">4 m</text>
+        <text class="lr-label" x="318" y="155">2 m</text>
+        <text class="lr-label" x="318" y="100">1 m</text>
+        <text class="lr-label" x="318" y="73">0.5 m</text>
+        <path class="lr-good" d="M286 330 L296 342 L316 316"/>
+        <text class="lr-label" x="300" y="378" text-anchor="middle">×2 each step,</text>
+        <text class="lr-label" x="300" y="398" text-anchor="middle">same subject in frame</text>
+        <text class="lr-label muted" x="100" y="506" text-anchor="middle">Jump</text>
+        <text class="lr-label muted" x="300" y="506" text-anchor="middle">Ladder</text>
+      </svg>
+      <figcaption class="label">Side view · getting close without losing the solve</figcaption>
+    </figure>
+  </div>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>Pass</th><th>Distance from the walls</th><th>Facing</th><th>How</th></tr></thead>
+      <tbody>
+        <tr><td><span class="n">1</span>Outer lap</td><td class="num">≈1 m</td><td>Across the room</td><td>Two heights. Round the corners, don't swivel in them.</td></tr>
+        <tr><td><span class="n">2</span>Inner ring</td><td class="num">≈2.5–4 m</td><td>Out at the walls</td><td>The bridge between far and near. Turn from facing in to facing out over the first few metres, about 15° per photo.</td></tr>
+        <tr><td><span class="n">3</span>Ladder and sweep</td><td class="num">4 → 2 → 1 → 0.5 m</td><td>The wall or piece</td><td>Step in from the ring, sweep sideways along the wall with about 70% overlap, step back out the same way. One ladder per detail zone.</td></tr>
+        <tr><td><span class="n">4</span>Orbits</td><td class="num">≈1–2 m from the piece</td><td>The piece, centred</td><td>Two heights. Start and finish on the inner ring.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="two">
+    <div class="notes">
+      <h3>Between one photo and the next</h3>
+      <div><p><strong>Turn 15–20° at most</strong> (the fisheye forgives a little more), <strong>never more than 2× closer or further</strong>, and keep <strong>60–70% of the picture shared</strong>. When unsure, take one more.</p></div>
+      <div><p><strong>Never start close-ups cold.</strong> Every detail sweep begins and ends on the main walk.</p></div>
+      <div><p><strong>Shoot in walking order.</strong> The file numbers tell the solver which photos are neighbours, so don't come back later for a missed spot without walking back into it.</p></div>
+      <div><p><strong>Plan the detail zones first:</strong> which paintings, labels and surfaces need close-ups, so every ladder is planned.</p></div>
+    </div>
+    <div class="notes">
+      <h3>Repeated patterns</h3>
+      <div><p>Identical windows, frames, display cases and tiles make look-alike spots, and the solver can match the wrong one. That is what doubled the museum's window wall.</p></div>
+      <div><p><strong>Keep something unique in every frame:</strong> a door, a corner, a sign, a different exhibit. Avoid frames filled only by the repeating thing.</p></div>
+      <div><p><strong>Same camera settings throughout:</strong> exposure, white balance and lens. A small focus change for the close-ups is fine (the museum run measured 0.2%).</p></div>
+    </div>
+  </div>
+  <div class="callout">
+    <span class="label">In the app: large rooms</span>
+    <p>Put the close-ups in a <strong>sub-folder</strong> of the job's folder, as with the museum's "close-up focus changed". Choose <strong>Learned (ALIKED + LightGlue)</strong> under Feature matching: it copes with bigger angle and distance changes and with repeated patterns, for about 10–15 minutes more solving. In the log, <span class="mono">registered N of M images</span> above 95% is healthy for a room like this. If the result shows doubled, sideways-shifted copies of windows or frames, the solve glued a group in the wrong place: reshoot that wall as a ladder rather than retraining.</p>
+  </div>
+</section>
+
+<section aria-labelledby="corridors">
+  <div style="display:grid;gap:8px">
+    <span class="label">Fuji photos · fisheye · corridors, tunnels, underpasses, arcades</span>
+    <h2 id="corridors">Corridors, tunnels and underpasses</h2>
+  </div>
+  <p class="lede">Laps close to each wall, looking slightly forward, give sharp walls. But the two sides of the passage never see each other well: from each wall the ceiling sits at the top edge of the frame, at a shallow angle. The solver can't match one side to the other, joins them only at the ends, and each side drifts its own way. The middle of the passage then comes out twice. In the Makati underpass, the arched ceiling came out about a metre apart sideways, and the mural on it showed as a ghost face.</p>
+  <div class="big-figs">
+    <figure>
+      <svg viewBox="0 0 760 440" role="img" aria-labelledby="cor-plan-title">
+        <title id="cor-plan-title">Top-down plan of a passage about 5 metres wide. Pass 1 laps run close to each wall, facing along the passage. Pass 2 zig-zags from one wall to the other while facing forward. Pass 3 runs along each wall facing the opposite wall. Pass 4 runs down the middle with the camera tilted up at the ceiling.</title>
+        <line class="lr-wall" x1="40" y1="110" x2="720" y2="110"/>
+        <line class="lr-wall" x1="40" y1="330" x2="720" y2="330"/>
+        <!-- 1: wall laps, facing along -->
+        <line class="lr-pass p1" x1="60" y1="132" x2="700" y2="132"/>
+        <line class="lr-pass p1" x1="60" y1="308" x2="700" y2="308"/>
+        <g class="lr-cam p1"><circle cx="120" cy="132" r="6"/><line x1="120" y1="132" x2="210" y2="128"/></g>
+        <g class="lr-cam p1"><circle cx="620" cy="308" r="6"/><line x1="620" y1="308" x2="530" y2="312"/></g>
+        <!-- 2: zig-zag across, facing forward -->
+        <path class="lr-pass p2" d="M60 150 L170 290 L280 150 L390 290 L500 150 L610 290 L700 170"/>
+        <g class="lr-cam p2"><circle cx="225" cy="220" r="6"/><line x1="225" y1="220" x2="300" y2="214"/></g>
+        <!-- 3: sideways, facing the opposite wall -->
+        <path class="lr-pass p3" d="M330 152 L660 152"/>
+        <path class="lr-pass p3" d="M330 288 L660 288"/>
+        <g class="lr-cam p3"><circle cx="400" cy="152" r="6"/><line x1="400" y1="152" x2="400" y2="324"/></g>
+        <g class="lr-cam p3"><circle cx="560" cy="288" r="6"/><line x1="560" y1="288" x2="560" y2="116"/></g>
+        <!-- 4: centre line, tilted up -->
+        <line class="lr-pass" style="stroke: var(--solid)" x1="60" y1="220" x2="700" y2="220"/>
+        <g class="lr-cam p4"><circle cx="470" cy="220" r="6"/></g>
+        <g class="lr-cam p4"><circle cx="640" cy="220" r="6"/></g>
+        <text class="lr-label" x="470" y="246" text-anchor="middle">up 45°</text>
+        <!-- pass numbers -->
+        <g><circle class="lr-badge" cx="60" cy="88" r="12" fill="var(--seen)"/><text class="lr-num" x="60" y="93" text-anchor="middle">1</text></g>
+        <g><circle class="lr-badge" cx="170" cy="312" r="12" fill="var(--partial)"/><text class="lr-num" x="170" y="317" text-anchor="middle">2</text></g>
+        <g><circle class="lr-badge" cx="330" cy="176" r="12" fill="var(--tape)"/><text class="lr-num" x="330" y="181" text-anchor="middle">3</text></g>
+        <g><circle class="lr-badge" cx="700" cy="196" r="12" fill="var(--solid)"/><text class="lr-num" x="700" y="201" text-anchor="middle">4</text></g>
+        <text class="lr-label muted" x="380" y="372" text-anchor="middle">passage ≈ 5 m wide · each pass walks the whole length</text>
+        <text class="lr-label muted" x="380" y="396" text-anchor="middle">pass 1 alone gives two sides that never meet</text>
+      </svg>
+      <figcaption class="label">Plan · 1 wall laps · 2 zig-zag · 3 sideways · 4 centre, tilted up</figcaption>
+    </figure>
+    <figure>
+      <svg viewBox="0 0 400 460" role="img" aria-labelledby="cor-end-title">
+        <title id="cor-end-title">End view of an arched passage, side by side. Left: a camera close to the wall facing along the passage sees the ceiling only at the top edge of its frame, marked as failing. Right: a camera close to the wall facing across sees the far wall, the ceiling and the floor together, marked as working.</title>
+        <line x1="200" y1="24" x2="200" y2="440" stroke="var(--rule)" stroke-width="1"/>
+        <!-- left: facing along the passage -->
+        <path class="lr-wall" d="M28 340 L28 190 Q100 70 172 190 L172 340"/>
+        <line class="lr-wall" x1="28" y1="340" x2="172" y2="340" style="stroke-width:1.5"/>
+        <g class="lr-cam p1"><circle cx="50" cy="280" r="7"/>
+          <line x1="50" y1="280" x2="86" y2="133"/><line x1="50" y1="280" x2="28" y2="205"/></g>
+        <path class="lr-bad" d="M108 250 L132 274 M132 250 L108 274"/>
+        <!-- right: facing across -->
+        <path class="lr-wall" d="M228 340 L228 190 Q300 70 372 190 L372 340"/>
+        <line class="lr-wall" x1="228" y1="340" x2="372" y2="340" style="stroke-width:1.5"/>
+        <g class="lr-cam p3"><circle cx="350" cy="280" r="7"/>
+          <line x1="350" y1="280" x2="300" y2="130"/><line x1="350" y1="280" x2="242" y2="168"/>
+          <line x1="350" y1="280" x2="228" y2="280"/><line x1="350" y1="280" x2="252" y2="340"/></g>
+        <path class="lr-good" d="M280 236 L290 248 L310 222"/>
+        <text class="lr-label" x="100" y="374" text-anchor="middle">Facing along</text>
+        <text class="lr-label muted" x="100" y="396" text-anchor="middle">ceiling only at</text>
+        <text class="lr-label muted" x="100" y="416" text-anchor="middle">the frame's edge</text>
+        <text class="lr-label" x="300" y="374" text-anchor="middle">Facing across</text>
+        <text class="lr-label muted" x="300" y="396" text-anchor="middle">far wall, ceiling</text>
+        <text class="lr-label muted" x="300" y="416" text-anchor="middle">and floor together</text>
+      </svg>
+      <figcaption class="label">End view · what one fisheye photo sees of an arched passage</figcaption>
+    </figure>
+  </div>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>Pass</th><th>Where</th><th>Facing</th><th>How</th></tr></thead>
+      <tbody>
+        <tr><td><span class="n">1</span>Wall laps</td><td>≈0.5–1 m from each wall</td><td>Along the passage, a little toward the wall</td><td>Your usual laps: sharp walls. Two or three heights. Do the same number of laps on both sides.</td></tr>
+        <tr><td><span class="n">2</span>Zig-zag</td><td>From wall to wall</td><td>Forward</td><td>Cross the passage every 4–6 m. Each photo shares a lot with the last, so the path itself carries the solve from one side to the other.</td></tr>
+        <tr><td><span class="n">3</span>Sideways</td><td>Along each wall</td><td>The opposite wall, tilted up a little</td><td>One pass per side, a small step between photos. Both passes see the same ceiling from comfortable angles, so they match each other. The strongest single fix.</td></tr>
+        <tr><td><span class="n">4</span>Centre, up</td><td>Down the middle</td><td>Up about 45°</td><td>For a painted or detailed ceiling: puts it in the middle of the frame, where the fisheye is sharpest, instead of at the edge.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="two">
+    <div class="notes">
+      <h3>The rule underneath</h3>
+      <div><p><strong>Every surface should be seen well from both sides of the passage,</strong> not only at a shallow angle from each side. Walls are easy; the ceiling and the floor in the middle are what get missed.</p></div>
+      <div><p><strong>Move between photos; don't turn on the spot.</strong> Photos taken from one point while you rotate have no parallax, so they place no new detail and make a weak bridge. Zig-zag and sideways passes turn the view gradually while you walk.</p></div>
+      <div><p><strong>Keep the passes in walking order</strong> and join them at the ends with a gradual turn, as with corners in a room.</p></div>
+    </div>
+    <div class="notes">
+      <h3>Long, repetitive passages</h3>
+      <div><p>Tiles, vents and lights repeat every few metres, so look-alike spots are everywhere. <strong>Keep something unique in frame</strong>: a sign, a shop front, a stain, a section of mural.</p></div>
+      <div><p>In very long passages, add a <strong>zig-zag every 10–15 m</strong> even if you skip the rest, so the two sides are tied together along the whole length, not only at the ends.</p></div>
+      <div><p>People walking through are fine with <strong>Ignore moving things: Strong</strong>, but wait for gaps on the sideways pass: someone between you and the far wall hides exactly what that pass is for.</p></div>
+    </div>
+  </div>
+  <div class="callout">
+    <span class="label">In the app: corridors</span>
+    <p>Use <strong>Learned (ALIKED + LightGlue)</strong> feature matching. Every result now comes with <span class="mono">cameras.zip</span>, the solved camera positions: open it in COLMAP (File → Import model, pick the unzipped <span class="mono">sparse/0</span> folder) and look along the passage. Two arched ceilings, or the two wall laps sitting under different copies of the same surface, mean the sides never joined. No setting fixes that; a sideways or zig-zag pass through that stretch does.</p>
   </div>
 </section>
 

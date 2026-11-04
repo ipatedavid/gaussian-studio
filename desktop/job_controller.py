@@ -7,6 +7,7 @@ import traceback
 import urllib.error
 import urllib.request
 import uuid
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -16,13 +17,16 @@ from config import (
     DEPTH_GUIDANCE, ENGINE_LABELS, ENGINES, GUIDANCE_LABELS, MATCHER_LABELS, QUALITY_LEVELS,
     AppConfig, quality_steps,
 )
-from runpod_client import PodCreationUncertainError, RunPodCapacityError, RunPodClient, RunPodError
+from runpod_client import (
+    PodCreationUncertainError, RunPodCapacityError, RunPodClient, RunPodError, RunPodRateLimitError,
+)
+import gpu_wait
 from drive_client import DriveClient
 from gpu_speed import duration_text
 from scp_client import ConnectionLostError, ScpClient
 from pod_ledger import PodLedger
 from storage import (
-    DEFAULT_VIDEO_FPS, folder_photos, plan_drive_input, plan_drive_mixed, plan_drive_video,
+    DEFAULT_VIDEO_FPS, pick_photos, plan_drive_input, plan_drive_mixed, plan_drive_video,
     plan_input, plan_mixed, safe_dir_name,
 )
 
@@ -33,8 +37,19 @@ PREVIEW_START_TIMEOUT = 900
 # A job script that is alive but leaves the result missing this long after the
 # trainer stopped is treated as stuck; the app then finishes the job itself.
 STUCK_JOB_SECONDS = 120
-REJOIN_ATTEMPTS = 8  # with REJOIN_WAIT_SECONDS: about four minutes to get the pod back
+# A GPU whose host set its power limit below this share of the stock limit trains
+# slower than its specs suggest (an RTX 5080 capped at 250 of 360 W: about half a
+# 3090's speed). Only a warning: the job carries on.
+POWER_CAP_WARN_SHARE = 0.85
+# A lost connection (this computer's internet, usually) never ends a job: the app keeps
+# trying, with growing pauses, for REJOIN_GIVE_UP_SECONDS, then keeps the pod for rejoining.
+REJOIN_GIVE_UP_SECONDS = 2 * 3600
 REJOIN_WAIT_SECONDS = 30
+REJOIN_MAX_WAIT_SECONDS = 300
+# A pod on a host in the blocked list (config.blocked_ssh_hosts) is terminated; the job
+# waits this long before the next try, and gives up after this many.
+BLOCKED_HOST_PAUSE = 120
+BLOCKED_HOST_TRIES = 5
 
 
 def viewer_responds(url: str) -> bool:
@@ -57,6 +72,10 @@ class JobCancelledError(RuntimeError):
     pass
 
 
+class PodUnreachableError(RuntimeError):
+    """The pod stayed out of reach for REJOIN_GIVE_UP_SECONDS; it is kept, never terminated."""
+
+
 def _time_left(state: dict) -> str:
     """", about 3 h 10 min left", from the speed between training start and the newest checkpoint."""
     step, total = state.get("step"), state.get("total_steps")
@@ -64,6 +83,18 @@ def _time_left(state: dict) -> str:
     if not (step and total and started and saved) or saved <= started or step >= total:
         return ""
     return f", about {duration_text((total - step) * (saved - started) / step)} left"
+
+
+def power_cap_warning(gpu: dict, host: str) -> str | None:
+    """The warning for a GPU capped well below its stock power limit, else None."""
+    limit, stock = gpu["limit_w"], gpu["stock_w"]
+    if stock <= 0 or limit >= POWER_CAP_WARN_SHARE * stock:
+        return None
+    return (
+        f"This pod's {gpu['name']} is power-capped at {limit:.0f} W of its stock "
+        f"{stock:.0f} W (host {host}), so it will train slower than usual for this card. "
+        "Stop the job if you'd rather try another pod."
+    )
 
 
 class JobController(QtCore.QObject):
@@ -77,6 +108,7 @@ class JobController(QtCore.QObject):
     preview_ready = QtCore.Signal(str)    # local URL of the live training viewer
     preview_closed = QtCore.Signal(str)   # why the preview ended, shown in its tab
     stop_started = QtCore.Signal()
+    warning = QtCore.Signal(str)          # worth seeing now, but the job carries on
 
     def __init__(
         self, config: AppConfig, *, ledger: PodLedger | None = None,
@@ -113,6 +145,7 @@ class JobController(QtCore.QObject):
         self.rating_note = ""
         self.status_text = "Waiting to start"
         self.results_dir: Path | None = None
+        self._keep_reason = ""  # why a pod was kept instead of terminated, for the message
         # Shown in the job list and kept in the job history.
         self.context = ""
         self.rate_text = ""
@@ -273,6 +306,31 @@ class JobController(QtCore.QObject):
             self._stop_done.set()
             if active_pod_id:
                 self.active_pod_changed.emit(active_pod_id)
+
+    def _reject_blocked_pod(self, client: RunPodClient, pod_id: str, host: str) -> None:
+        """Terminate a pod that landed on a blocked host, and wait until RunPod stops listing
+        it: the next pod has the same name, and must not be mistaken for this one."""
+        self.log_line.emit(
+            f"Pod {pod_id} landed on host {host}, whose pods never accept SSH. "
+            "Terminating it and waiting for another card."
+        )
+        self.status_changed.emit("Letting go of a pod on a blocked host...")
+        client.terminate_pod(pod_id)
+        self._ledger(state="terminated")
+        self._clear_active_pod(pod_id)
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline:
+            self._check_stop_requested()
+            try:
+                if not any(pod.get("id") == pod_id
+                           and str(pod.get("desiredStatus") or "").upper() != "TERMINATED"
+                           for pod in client.list_pods()):
+                    break
+            except RunPodError:
+                pass
+            if self._stop_requested.wait(5):
+                break
+        self.log_line.emit(f"Pod {pod_id} terminated.")
 
     def _wait_for_public_ssh(self, client: RunPodClient, pod_id: str) -> tuple[str, int]:
         deadline = time.monotonic() + 600
@@ -451,6 +509,7 @@ class JobController(QtCore.QObject):
         engine: str | None = None,
         drive_folder: tuple[str, str] | None = None, results_root: Path | None = None,
         drive_video_id: str = "", more_videos: tuple[Path, ...] = (),
+        photo_folders: tuple[str, ...] = (), wait_for_gpu: bool = False,
         start: bool = True,
     ) -> None:
         """Mark the job running and start its thread (or leave that to start_thread())."""
@@ -489,6 +548,10 @@ class JobController(QtCore.QObject):
             options["drive_video_id"] = drive_video_id
         if more_videos:
             options["more_videos"] = tuple(more_videos)
+        if photo_folders:
+            options["photo_folders"] = tuple(photo_folders)
+        if wait_for_gpu:
+            options["wait_for_gpu"] = True
         self._thread = threading.Thread(
             target=self._run_job, args=(source, gpu_selection), kwargs=options, daemon=True,
         )
@@ -503,17 +566,19 @@ class JobController(QtCore.QObject):
     def _plan(
         self, source: Path, source_type: str, video_fps: float,
         drive_folder: tuple[str, str] | None, drive_video_id: str, results_root: Path | None,
-        more_videos: tuple[Path, ...] = (),
+        more_videos: tuple[Path, ...] = (), photo_folders: tuple[str, ...] = (),
     ):
         """Re-check the input from scratch; returns (plan, drive client, drive listing).
 
-        "mixed" is every photo in the source folder plus more_videos; "drive_mixed"
-        is every photo in the Drive folder plus the videos in drive_video_id.
+        "mixed" is the source folder's photos plus more_videos; "drive_mixed"
+        is the Drive folder's photos plus the videos in drive_video_id.
+        photo_folders picks which photos: the folder's own ("") and which
+        sub-folders; none means the folder's own photos only.
         """
         if source_type == "mixed":
             source = source.expanduser().resolve(strict=True)
             plan = plan_mixed(
-                source, tuple(folder_photos(source)),
+                source, tuple(pick_photos(source, photo_folders)),
                 tuple(path.expanduser().resolve(strict=True) for path in more_videos),
                 self.config.volume_gb, self.config.pipeline_num_downscales, video_fps,
             )
@@ -524,6 +589,7 @@ class JobController(QtCore.QObject):
                 source, source_type, self.config.volume_gb,
                 self.config.pipeline_num_downscales, video_fps,
                 tuple(path.expanduser().resolve(strict=True) for path in more_videos),
+                photo_folders,
             )
             return plan, None, None
         if not drive_folder:
@@ -536,6 +602,15 @@ class JobController(QtCore.QObject):
         self.status_changed.emit("Reading the Google Drive folder...")
         drive = DriveClient(credentials)
         listing = drive.list_images(*drive_folder)
+        wanted_groups = set(photo_folders or ("",))
+        missing_groups = wanted_groups - {item.group for item in listing.files} - {""}
+        if missing_groups:
+            raise RuntimeError(
+                f"The sub-folder '{sorted(missing_groups)[0]}' has no photos in "
+                f"'{listing.folder_name}' any more."
+            )
+        listing = replace(listing, files=tuple(
+            item for item in listing.files if item.group in wanted_groups))
         root = results_root or self.config.results_root()
         if source_type == "drive":
             plan = plan_drive_input(
@@ -663,6 +738,7 @@ class JobController(QtCore.QObject):
         engine: str = "nerfstudio", spirula_version: str = "",
         drive_folder: tuple[str, str] | None = None, results_root: Path | None = None,
         drive_video_id: str = "", more_videos: tuple[Path, ...] = (),
+        photo_folders: tuple[str, ...] = (), wait_for_gpu: bool = False,
     ) -> None:
         pod_id = None
         drive = None
@@ -675,7 +751,7 @@ class JobController(QtCore.QObject):
         try:
             plan, drive, drive_listing = self._plan(
                 source, source_type, video_fps, drive_folder, drive_video_id,
-                results_root, more_videos,
+                results_root, more_videos, photo_folders,
             )
             source = plan.source
             self.log_line.emit(f"Job {self.job_id}; its pod will be named {self.pod_name}.")
@@ -709,7 +785,8 @@ class JobController(QtCore.QObject):
                 self.log_line.emit(
                     f"Spirula splat type: {self.config.spirula_primitive}; quality "
                     f"{QUALITY_LEVELS[self.config.spirula_quality][0]} (up to "
-                    f"{QUALITY_LEVELS[self.config.spirula_quality][2]:,} splats, "
+                    f"{self.config.splat_budget():,} splats"
+                    + (" set by hand" if self.config.splats_override else "") + ", "
                     + (f"{self.config.pipeline_max_steps:,} steps set by hand)."
                        if self.config.steps_override else
                        f"about {quality_steps(self.config.spirula_quality, plan.image_count):,} steps)."
@@ -732,6 +809,12 @@ class JobController(QtCore.QObject):
                        if self.config.spirula_guidance in DEPTH_GUIDANCE else "")
                     + (f"; ignore moving things {self.config.spirula_distraction}"
                        if self.config.spirula_distraction != "off" else "")
+                    + ("; one surface per pixel"
+                       if self.config.spirula_one_surface and self.config.spirula_guidance == "off"
+                       else "")
+                    + ("; people masked"
+                       if self.config.spirula_people_masks and not self.config.spirula_object
+                       else "")
                     + "."
                 )
             image_name = self.config.image_for(engine)
@@ -801,75 +884,98 @@ class JobController(QtCore.QObject):
             client = RunPodClient(self.config.runpod_api_key, self.config.runpod_graphql_url)
             self.status_changed.emit("Checking GPU availability...")
             self.log_line.emit("Checking the selected GPU's current capacity...")
-            candidates = client.select_gpu_types(
-                self.config.max_gpu_price, self.config.min_gpu_vram_gb,
-                cloud_type=self.config.cloud_type,
-                container_disk_gb=self.config.container_disk_gb,
-                volume_gb=volume_gb,
-                min_vcpu=self.config.min_vcpu,
-                max_vram_gb=self.config.max_gpu_vram_gb,
-                min_memory_gb=self.config.min_memory_gb,
-            )
-            candidate = next((item for item in candidates
-                              if (item["id"], item["_cloud_type"]) == gpu_selection), None)
-            if candidate is None or not candidate["_available"]:
-                raise RunPodCapacityError(
-                    "Selected GPU no longer has matching public-SSH capacity. "
-                    "Refresh the GPU list and choose another."
-                )
-            self.log_line.emit(
-                f"Selected GPU: {candidate['_display_name']} ({candidate['_cloud_type']}, "
-                f"{candidate['_stock_status']} stock, ${candidate['_hourly_price']:.3f}/hr quoted)"
-            )
-            self.gpu_label = f"{candidate['_display_name']} ({candidate['_cloud_type']})"
-            self.cost_per_hour = candidate["_hourly_price"]
-            self._check_stop_requested()
-            self.status_changed.emit("Creating one RunPod pod...")
-            self.log_line.emit("Sending one RunPod pod creation request...")
-            # Recorded before the request: if anything goes wrong from here on,
-            # the pod name is on disk and the untracked-pod check can find it.
-            self.pod_requested = True
-            self._ledger(
-                state="creating", engine=engine, gpu=self.gpu_label,
-                results_dir=str(results_dir), steps=self.config.pipeline_max_steps,
-            )
-            try:
-                pod = client.create_pod(
-                    job_id=self.job_id, image_name=image_name, engine=engine,
-                    ssh_public_key=public_key, gpu_type_id=candidate["id"],
-                    cloud_type=candidate["_cloud_type"],
-                    container_disk_gb=self.config.container_disk_gb,
-                    volume_gb=volume_gb, min_vcpu=self.config.min_vcpu,
-                    min_memory_gb=self.config.min_memory_gb,
-                )
-            except PodCreationUncertainError:
-                self._ledger(state="uncertain")
-                raise
-            except Exception:
-                self._ledger(state="not_created")
-                raise
-            pod_id = pod.pod_id
-            if pod.cost_per_hour is not None:
-                self.cost_per_hour = pod.cost_per_hour
-            with self._lock:
-                self.active_pod_id = pod_id
-                self._active_client = client
-            self._ledger(state="running", pod_id=pod_id)
-            self.active_pod_changed.emit(pod_id)
-            if pod.recovered_from_error:
+            # A pod on a blocked host is let go and another card waited for. The free card is
+            # often that same host's, so each retry waits a while first, and the job gives up
+            # after a few.
+            rejected = 0
+            while True:
+                while True:
+                    candidate = self._gpu_offer(client, gpu_selection, volume_gb)
+                    if candidate is None or not candidate["_available"]:
+                        if not wait_for_gpu:
+                            raise RunPodCapacityError(
+                                "Selected GPU no longer has matching public-SSH capacity. "
+                                "Refresh the GPU list and choose another."
+                            )
+                        candidate = self._wait_for_gpu(client, gpu_selection, volume_gb)
+                    self.log_line.emit(
+                        f"Selected GPU: {candidate['_display_name']} ({candidate['_cloud_type']}, "
+                        f"{candidate['_stock_status']} stock, ${candidate['_hourly_price']:.3f}/hr quoted)"
+                    )
+                    self.gpu_label = f"{candidate['_display_name']} ({candidate['_cloud_type']})"
+                    self.cost_per_hour = candidate["_hourly_price"]
+                    self._check_stop_requested()
+                    self.status_changed.emit("Creating one RunPod pod...")
+                    self.log_line.emit("Sending one RunPod pod creation request...")
+                    # Recorded before the request: if anything goes wrong from here on,
+                    # the pod name is on disk and the untracked-pod check can find it.
+                    self.pod_requested = True
+                    self._ledger(
+                        state="creating", engine=engine, gpu=self.gpu_label,
+                        results_dir=str(results_dir), steps=self.config.pipeline_max_steps,
+                    )
+                    try:
+                        pod = client.create_pod(
+                            job_id=self.job_id, image_name=image_name, engine=engine,
+                            ssh_public_key=public_key, gpu_type_id=candidate["id"],
+                            cloud_type=candidate["_cloud_type"],
+                            container_disk_gb=self.config.container_disk_gb,
+                            volume_gb=volume_gb, min_vcpu=self.config.min_vcpu,
+                            min_memory_gb=self.config.min_memory_gb,
+                        )
+                    except PodCreationUncertainError:
+                        self._ledger(state="uncertain")
+                        raise
+                    except RunPodCapacityError:
+                        # RunPod says no pod was made: someone took the last card first.
+                        self._ledger(state="not_created")
+                        if not wait_for_gpu:
+                            raise
+                        self.log_line.emit(
+                            "The GPU was taken before the pod could be created; waiting again.")
+                        continue
+                    except Exception:
+                        self._ledger(state="not_created")
+                        raise
+                    break
+                pod_id = pod.pod_id
+                if pod.cost_per_hour is not None:
+                    self.cost_per_hour = pod.cost_per_hour
+                with self._lock:
+                    self.active_pod_id = pod_id
+                    self._active_client = client
+                self._ledger(state="running", pod_id=pod_id)
+                self.active_pod_changed.emit(pod_id)
+                if pod.recovered_from_error:
+                    self.log_line.emit(
+                        f"RunPod returned an error, but pod {pod_id} was found with the "
+                        "requested settings. Continuing this job without creating another pod."
+                    )
+                else:
+                    self.log_line.emit(f"Pod created: {pod_id}")
+                if pod.cost_per_hour is not None and pod.cost_per_hour > self.config.max_gpu_price:
+                    raise RuntimeError(
+                        f"Pod price ${pod.cost_per_hour:.3f}/hr exceeds the configured "
+                        f"${self.config.max_gpu_price:.3f}/hr limit."
+                    )
+                self._check_stop_requested()
+                endpoint = self._wait_for_public_ssh(client, pod_id)
+                if endpoint[0] not in set(self.config.blocked_ssh_hosts or []):
+                    break
+                self._reject_blocked_pod(client, pod_id, endpoint[0])
+                pod_id = None  # already let go: nothing for the wrap-up to terminate
+                rejected += 1
+                if not wait_for_gpu or rejected >= BLOCKED_HOST_TRIES:
+                    raise RunPodCapacityError(
+                        f"The pod landed on host {endpoint[0]}, whose pods never accept SSH, "
+                        f"so it was terminated ({rejected} time{'s' if rejected != 1 else ''}). "
+                        "Try again later, or pick another GPU type."
+                    )
                 self.log_line.emit(
-                    f"RunPod returned an error, but pod {pod_id} was found with the "
-                    "requested settings. Continuing this job without creating another pod."
+                    f"Waiting {BLOCKED_HOST_PAUSE // 60} minutes before trying for another card."
                 )
-            else:
-                self.log_line.emit(f"Pod created: {pod_id}")
-            if pod.cost_per_hour is not None and pod.cost_per_hour > self.config.max_gpu_price:
-                raise RuntimeError(
-                    f"Pod price ${pod.cost_per_hour:.3f}/hr exceeds the configured "
-                    f"${self.config.max_gpu_price:.3f}/hr limit."
-                )
-            self._check_stop_requested()
-            endpoint = self._wait_for_public_ssh(client, pod_id)
+                if self._stop_requested.wait(BLOCKED_HOST_PAUSE):
+                    raise JobCancelledError("Stop requested while waiting for another card.")
             self._check_stop_requested()
             transfer = ScpClient(key, *endpoint)
             def current_endpoint():
@@ -881,6 +987,7 @@ class JobController(QtCore.QObject):
                 status_check=self._bootstrap_status_check(client, pod_id),
                 endpoint_provider=current_endpoint,
             )
+            self._check_gpu_power(transfer)
             self._check_stop_requested()
             free_bytes = transfer.free_bytes()
             required_bytes = input_bytes + working_reserve
@@ -962,6 +1069,17 @@ class JobController(QtCore.QObject):
                     f"at least {working_reserve / 1024**3:.1f} GiB was planned. "
                     "Processing was not started."
                 )
+            groups = plan.camera_groups
+            if groups:
+                counts: dict[str, int] = {}
+                for group in groups.values():
+                    counts[group] = counts.get(group, 0) + 1
+                self.log_line.emit(
+                    "Each sub-folder gets its own lens fit (focus changes the focal length): "
+                    + ", ".join(f"{group} ({count} photos)" for group, count in sorted(counts.items()))
+                    + "."
+                )
+                transfer.upload_camera_groups(groups, self.log_line.emit)
             self._check_stop_requested()
             self._on_pod = True
             self.status_changed.emit("Processing images...")
@@ -980,11 +1098,15 @@ class JobController(QtCore.QObject):
                         preview=self.config.live_preview,
                         spirula_primitive=self.config.spirula_primitive,
                         spirula_quality=self.config.spirula_quality,
+                        spirula_max_splats=(self.config.spirula_max_splats
+                                            if self.config.splats_override else 0),
                         spirula_vignetting=self.config.spirula_vignetting,
                         spirula_object=self.config.spirula_object,
                         spirula_turntable=self.config.spirula_turntable,
                         spirula_main_scene=self.config.spirula_main_scene,
                         spirula_matcher=self.config.spirula_matcher,
+                        spirula_one_surface=self.config.spirula_one_surface,
+                        spirula_people_masks=self.config.spirula_people_masks,
                         steps_override=self.config.steps_override,
                         fisheye=self.config.fisheye_lens,
                         fisheye_focal_mm=self.config.fisheye_focal_mm,
@@ -1011,6 +1133,9 @@ class JobController(QtCore.QObject):
             self.results_dir = results_dir
             self.log_line.emit(f"Results saved to {results_dir}")
         except Exception as exc:
+            if isinstance(exc, PodUnreachableError) and not self._stop_requested.is_set():
+                preserve_pod = True
+                self._keep_reason = str(exc)
             skip_termination = self._report_failure(exc)
         finally:
             self._wrap_up(pod_id, client, preserve_pod, skip_termination, success)
@@ -1105,6 +1230,9 @@ class JobController(QtCore.QObject):
             self.results_dir = results_dir
             self.log_line.emit(f"Results saved to {results_dir}")
         except Exception as exc:
+            if isinstance(exc, PodUnreachableError) and not self._stop_requested.is_set():
+                preserve_pod = True
+                self._keep_reason = str(exc)
             skip_termination = self._report_failure(exc)
         finally:
             self._wrap_up(pod_id, client, preserve_pod, skip_termination, success)
@@ -1137,6 +1265,26 @@ class JobController(QtCore.QObject):
         finally:
             stop_log.set()
 
+    def _check_gpu_power(self, transfer) -> None:
+        """Log the GPU's power limit; warn when the host capped it well below stock."""
+        try:
+            gpus = transfer.gpu_power()
+        except Exception:
+            gpus = None
+        if not gpus:
+            self.log_line.emit("[gpu] power limit: nvidia-smi didn't report it.")
+            return
+        for gpu in gpus:
+            limit, stock = gpu["limit_w"], gpu["stock_w"]
+            self.log_line.emit(
+                f"[gpu] {gpu['name']}: power limit {limit:.0f} W (stock {stock:.0f} W), "
+                f"max clock {gpu['max_sm_mhz']} MHz, host {transfer.host}"
+            )
+            message = power_cap_warning(gpu, transfer.host)
+            if message:
+                self.log_line.emit(f"[WARNING] {message}")
+                self.warning.emit(f"{self.title}: {message}")
+
     def _rejoin_job(self, transfer, engine: str, lost: ConnectionLostError) -> None:
         """The SSH session running the job dropped; the job outlives it, so follow it again.
 
@@ -1147,19 +1295,7 @@ class JobController(QtCore.QObject):
             "The job keeps running on the pod; reconnecting..."
         )
         self.status_changed.emit("Reconnecting to the pod...")
-        state = None
-        for attempt in range(REJOIN_ATTEMPTS):
-            try:
-                state = transfer.remote_job_state()
-                break
-            except Exception as exc:
-                self.log_line.emit(
-                    f"Pod not reachable yet ({exc}); attempt {attempt + 1} of {REJOIN_ATTEMPTS}."
-                )
-                if self._stop_requested.wait(REJOIN_WAIT_SECONDS):
-                    raise JobCancelledError("Stop requested from the app.")
-        if state is None:
-            raise lost
+        state = self._reach_pod(transfer)
         done = state.get("ply_ready") and state.get("summary_ready")
         if not (state.get("job_running") or state.get("trainer_running") or done):
             self.log_line.emit("The pod's job is no longer running and left no result.")
@@ -1167,6 +1303,39 @@ class JobController(QtCore.QObject):
         self.log_line.emit("Reconnected; the job is still going.")
         self.status_changed.emit("Processing images (reconnected)...")
         self._follow_with_log(transfer, engine)
+
+    def _reach_pod(self, transfer) -> dict:
+        """The pod's job state, retrying with growing pauses while the pod is out of reach.
+
+        Raises PodUnreachableError after REJOIN_GIVE_UP_SECONDS, so the pod is kept
+        (never terminated) and can be rejoined later.
+        """
+        started = time.monotonic()
+        wait = REJOIN_WAIT_SECONDS
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                state = transfer.remote_job_state()
+            except Exception as exc:
+                elapsed = time.monotonic() - started
+                if elapsed >= REJOIN_GIVE_UP_SECONDS:
+                    raise PodUnreachableError(
+                        f"The pod could not be reached for {elapsed / 60:.0f} minutes ({exc})."
+                    ) from exc
+                self.status_changed.emit("Reconnecting to the pod...")
+                self.log_line.emit(
+                    f"Pod not reachable ({exc}); attempt {attempt}, next try in {wait:.0f} s. "
+                    "The pod keeps training meanwhile; the app keeps trying for up to "
+                    f"{REJOIN_GIVE_UP_SECONDS // 3600} hours and never terminates it for this."
+                )
+                if self._stop_requested.wait(wait):
+                    raise JobCancelledError("Stop requested from the app.")
+                wait = min(wait * 2, REJOIN_MAX_WAIT_SECONDS)
+                continue
+            if attempt > 1:
+                self.log_line.emit("Reached the pod again.")
+            return state
 
     def _follow_remote_job(self, transfer, engine: str,
                            live_log: threading.Event | None = None) -> None:
@@ -1177,20 +1346,9 @@ class JobController(QtCore.QObject):
         """
         last_step = None
         stuck_since = None
-        failures = 0
         while True:
             self._check_stop_requested()
-            try:
-                state = transfer.remote_job_state()
-                failures = 0
-            except Exception as exc:
-                failures += 1
-                if failures >= 4:
-                    raise
-                self.log_line.emit(f"Pod check failed ({exc}); trying again.")
-                if self._stop_requested.wait(15):
-                    raise JobCancelledError("Stop requested from the app.")
-                continue
+            state = self._reach_pod(transfer)
             step, total = state.get("step"), state.get("total_steps")
             if step is not None and step != last_step:
                 last_step = step
@@ -1229,6 +1387,59 @@ class JobController(QtCore.QObject):
                 stuck_since = None
             if self._stop_requested.wait(15):
                 raise JobCancelledError("Stop requested from the app.")
+
+    def _gpu_offer(self, client: RunPodClient, gpu_selection: tuple[str, str],
+                   volume_gb: int) -> dict | None:
+        """The chosen GPU's current offer within the job's limits, or None if RunPod lists none."""
+        candidates = client.select_gpu_types(
+            self.config.max_gpu_price, self.config.min_gpu_vram_gb,
+            cloud_type=self.config.cloud_type,
+            container_disk_gb=self.config.container_disk_gb,
+            volume_gb=volume_gb,
+            min_vcpu=self.config.min_vcpu,
+            max_vram_gb=self.config.max_gpu_vram_gb,
+            min_memory_gb=self.config.min_memory_gb,
+        )
+        return next((item for item in candidates
+                     if (item["id"], item["_cloud_type"]) == gpu_selection), None)
+
+    def _wait_for_gpu(self, client: RunPodClient, gpu_selection: tuple[str, str],
+                      volume_gb: int) -> dict:
+        """Check the chosen GPU politely (see gpu_wait) until one is free; the Stop button ends it."""
+        name = f"{gpu_selection[0]} ({gpu_selection[1]})"
+        self.log_line.emit(
+            f"{name} has no free card right now. Waiting for one: checking about once a minute "
+            "until it is free or you press Stop."
+        )
+        started = last_note = time.monotonic()
+        delay, checks = gpu_wait.POLL_S, 0
+        while True:
+            minutes = (time.monotonic() - started) / 60
+            self.status_changed.emit(f"Waiting for {name}: {minutes:.0f} min, {checks} checks")
+            if self._stop_requested.wait(gpu_wait.jittered(delay)):
+                raise JobCancelledError("Stop requested while waiting for a GPU.")
+            if not gpu_wait.wait_turn(self._stop_requested):
+                raise JobCancelledError("Stop requested while waiting for a GPU.")
+            checks += 1
+            try:
+                candidate = self._gpu_offer(client, gpu_selection, volume_gb)
+            except RunPodRateLimitError as exc:
+                delay = gpu_wait.next_delay(delay, failed=True, retry_after=exc.retry_after)
+                self.log_line.emit(f"{exc} Next check in about {delay / 60:.0f} min.")
+                continue
+            except RunPodError as exc:
+                delay = gpu_wait.next_delay(delay, failed=True)
+                self.log_line.emit(
+                    f"Could not check RunPod ({exc}); next check in about {delay / 60:.0f} min.")
+                continue
+            delay = gpu_wait.next_delay(delay, failed=False)
+            if candidate is not None and candidate["_available"]:
+                self.log_line.emit(
+                    f"{name} is free after {minutes:.0f} min ({checks} checks); starting.")
+                return candidate
+            if time.monotonic() - last_note >= gpu_wait.NOTE_EVERY_S:
+                last_note = time.monotonic()
+                self.log_line.emit(f"Still waiting for {name}: {minutes:.0f} min, {checks} checks.")
 
     def _report_failure(self, exc: Exception) -> bool:
         """Log why the job stopped; True when the pod must not be terminated by us."""
@@ -1288,7 +1499,10 @@ class JobController(QtCore.QObject):
                 success = False
         elif pod_id and preserve_pod:
             self._ledger(state="kept")
-            self.error.emit(f"Download failed. Pod {pod_id} was kept so you can recover results; it may still be billing.")
+            self.error.emit(
+                f"{self._keep_reason or 'Download failed.'} Pod {pod_id} was kept so you can "
+                "recover results; it may still be billing. Rejoin it from the sidebar."
+            )
         with self._lock:
             cancelled = self._stop_requested.is_set()
             self.running = False

@@ -7,6 +7,7 @@ import sys
 import tempfile
 import time
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -114,8 +115,10 @@ class UploadBatchTests(unittest.TestCase):
             client = ScpClient(Path("/tmp/test-key"), "example", 1234)
             logs = []
             results = folder / "results"
+            no_camera_solve = subprocess.CompletedProcess([], 1, "", "")
             with patch.dict(os.environ, {"PATH": f"{folder}:{os.environ['PATH']}"}), \
-                    patch.object(client, "_remote_file_info", return_value=None):
+                    patch.object(client, "_remote_file_info", return_value=None), \
+                    patch.object(client, "_ssh", return_value=no_camera_solve):
                 client.download(results, logs.append)
             self.assertTrue(any(
                 line.startswith("[SCP] gaussian_splat.ply") and "100%" in line for line in logs
@@ -176,6 +179,30 @@ class UploadBatchTests(unittest.TestCase):
             self.assertTrue(any(line.startswith("[download] gaussian_splat.ply") for line in logs))
             self.assertFalse((folder / "scp-used").exists() and not
                              (folder / "results" / "pipeline_summary.json").exists())
+
+    def test_camera_solve_downloads_when_the_pod_saved_one(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            output = self._fake_pod(folder)
+            with zipfile.ZipFile(output / "cameras.zip", "w") as archive:
+                archive.writestr("sparse/0/images.bin", b"\0" * 8)
+            self._download(folder)
+            saved = folder / "results" / "cameras.zip"
+            self.assertEqual(saved.read_bytes(), (output / "cameras.zip").read_bytes())
+
+    def test_missing_or_broken_camera_solve_leaves_the_result_alone(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            output = self._fake_pod(folder)
+            self._download(folder)
+            self.assertFalse((folder / "results" / "cameras.zip").exists())
+            (output / "cameras.zip").write_bytes(b"not a zip")
+            logs = self._download(folder)
+            results = folder / "results"
+            self.assertFalse((results / "cameras.zip").exists())
+            self.assertFalse((results / "cameras.zip.part").exists())
+            self.assertTrue((results / "gaussian_splat.ply").is_file())
+            self.assertTrue(any("camera positions could not be downloaded" in line for line in logs))
 
     def test_parallel_parts_resume_after_dropped_connections(self):
         with tempfile.TemporaryDirectory() as temporary:

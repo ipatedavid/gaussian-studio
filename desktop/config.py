@@ -42,6 +42,8 @@ QUALITY_LEVELS = {
 # the real image count.
 STEP_REFERENCE_IMAGES = 300
 MAX_STEP_SCALE = 2.5
+# A splat limit set by hand (Spirula's --cap-max) must lie in this range.
+MIN_SPLATS, MAX_SPLATS = 100_000, 20_000_000
 
 
 def quality_steps(quality: str, images: int | None) -> int:
@@ -60,7 +62,7 @@ def scaled_steps(base: int, images: int | None) -> int:
 # The Spirula Linux release is built on Ubuntu 24.04 (needs glibc >= 2.38), so
 # it cannot run inside the Ubuntu 22.04 based nerfstudio image.
 DEFAULT_SPIRULA_IMAGE = "nvidia/cuda:12.6.3-base-ubuntu24.04"
-DEFAULT_SPIRULA_VERSION = "2026.9.30"
+DEFAULT_SPIRULA_VERSION = "2026.10.30"
 
 # Stands for "the photos" in local_unticked / drive_unticked (no video has this name).
 PHOTOS_ITEM = "/photos"
@@ -134,7 +136,7 @@ class AppConfig:
     spirula_floaters: str = os.getenv("SPIRULA_FLOATERS", "off")
     spirula_distraction: str = os.getenv("SPIRULA_DISTRACTION", "off")
     spirula_guidance: str = os.getenv("SPIRULA_GUIDANCE", "off")
-    spirula_depth_weight: float = float(os.getenv("SPIRULA_DEPTH_WEIGHT", "0.05"))
+    spirula_depth_weight: float = float(os.getenv("SPIRULA_DEPTH_WEIGHT", "0.3"))
     spirula_primitive: str = os.getenv("SPIRULA_PRIMITIVE", "3dgs")
     spirula_quality: str = os.getenv("SPIRULA_QUALITY", "medium")
     # Model lens darkening at the frame edges (turned on with the fisheye option).
@@ -143,8 +145,14 @@ class AppConfig:
     spirula_turntable: bool = os.getenv("SPIRULA_TURNTABLE", "0") == "1"
     spirula_main_scene: bool = os.getenv("SPIRULA_MAIN_SCENE", "0") == "1"
     spirula_matcher: str = os.getenv("SPIRULA_MATCHER", "sift")
+    # "One surface per pixel" without guidance maps (every guidance level already adds it).
+    spirula_one_surface: bool = os.getenv("SPIRULA_ONE_SURFACE", "0") == "1"
+    spirula_people_masks: bool = os.getenv("SPIRULA_PEOPLE_MASKS", "1") == "1"
     # Off: Spirula trains for its quality preset's steps. On: pipeline_max_steps.
     steps_override: bool = os.getenv("STEPS_OVERRIDE", "0") == "1"
+    # Off: the quality preset's splat limit. On: spirula_max_splats.
+    splats_override: bool = os.getenv("SPLATS_OVERRIDE", "0") == "1"
+    spirula_max_splats: int = int(os.getenv("SPIRULA_MAX_SPLATS", "3000000"))
     # Fisheye lens on the capture (Spirula only). Defaults: TTArtisan 7.5mm on
     # a Fujifilm APS-C body (23.5 mm sensor width).
     fisheye_lens: bool = os.getenv("FISHEYE_LENS", "0") == "1"
@@ -161,6 +169,13 @@ class AppConfig:
     max_gpu_vram_gb: int = int(os.getenv("MAX_GPU_VRAM_GB", "0"))  # 0: no limit
     gpu_count: int = 1
     cloud_type: str = os.getenv("CLOUD_TYPE", "ALL")
+    # Let a job wait (checking politely) for the picked GPU when none is free.
+    wait_for_gpu: bool = os.getenv("WAIT_FOR_GPU", "0") == "1"
+    # Hosts whose pods never accept SSH (every job on 99.69.17.69 since 2026-10-04 timed
+    # out). RunPod doesn't say which host a card is on before the pod exists, so a pod that
+    # lands on one of these is terminated as soon as its address shows, and the job waits
+    # for another card.
+    blocked_ssh_hosts: list = field(default_factory=lambda: ["99.69.17.69"])
     container_disk_gb: int = int(os.getenv("CONTAINER_DISK_GB", "30"))
     volume_gb: int = int(os.getenv("VOLUME_GB", "0"))
     min_vcpu: int = int(os.getenv("MIN_VCPU", "1"))
@@ -200,6 +215,10 @@ class AppConfig:
         if self.spirula_quality not in QUALITY_LEVELS:
             self.spirula_quality = "medium"
         try:
+            self.spirula_max_splats = min(MAX_SPLATS, max(MIN_SPLATS, int(self.spirula_max_splats)))
+        except (TypeError, ValueError):
+            self.spirula_max_splats = 3_000_000
+        try:
             self.video_fps = min(30.0, max(0.2, float(self.video_fps)))
         except (TypeError, ValueError):
             self.video_fps = 3.0
@@ -231,6 +250,10 @@ class AppConfig:
         if engine == "nerfstudio":
             return self.runpod_image.strip()
         raise ValueError(f"Unknown engine: {engine}")
+
+    def splat_budget(self) -> int:
+        """Most splats training may grow: the quality preset's, or the one set by hand."""
+        return self.spirula_max_splats if self.splats_override else QUALITY_LEVELS[self.spirula_quality][2]
 
     def save_state(self) -> None:
         data = asdict(self)

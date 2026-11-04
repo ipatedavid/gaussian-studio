@@ -54,7 +54,8 @@ COLUMNS = (
     "psnr_mid", "psnr_end", "late_gain_db",
     "vram_peak_gib", "vram_total_gib", "vram_projected_gib", "gpu_busy_pct",
     "guidance", "guidance_failed", "guidance_salvaged", "depth_seconds", "depth_coverage",
-    "depth_sfm_error", "ply_mb", "splats_in_file", "faint_share", "invisible_share",
+    "depth_sfm_error", "people_masked_photos", "people_masked_share", "masks_seconds",
+    "ply_mb", "splats_in_file", "faint_share", "invisible_share",
     "rating", "note", "settings",
 )
 
@@ -110,6 +111,14 @@ def parse_log(path: Path) -> dict:
             row["depth_seconds"] = depth.get("seconds")
             row["depth_coverage"] = depth.get("coverage")
             row["depth_sfm_error"] = depth.get("sfm_error_after")
+        elif message.startswith("[stats] masks "):
+            try:
+                masks = json.loads(message[len("[stats] masks "):])
+            except ValueError:
+                masks = {}
+            row["people_masked_photos"] = masks.get("with_people")
+            row["people_masked_share"] = masks.get("masked_share")
+            row["masks_seconds"] = masks.get("seconds")
         elif message.startswith("[stats] capture "):
             try:
                 capture = json.loads(message[len("[stats] capture "):])

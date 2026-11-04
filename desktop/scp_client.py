@@ -19,6 +19,7 @@ import tempfile
 import termios
 import threading
 import time
+import zipfile
 from pathlib import Path
 from typing import Callable
 
@@ -183,6 +184,30 @@ class ScpClient:
             ["ssh", *self.options, "-p", str(self.port), f"root@{self.host}", command],
             capture_output=True, text=True, timeout=timeout,
         )
+
+    def gpu_power(self) -> list[dict] | None:
+        """Each GPU's power limit against its stock limit, or None when nvidia-smi can't say."""
+        try:
+            result = self._ssh(
+                "nvidia-smi --query-gpu=name,power.limit,power.default_limit,clocks.max.sm "
+                "--format=csv,noheader,nounits", timeout=30,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+        if result.returncode:
+            return None
+        gpus = []
+        for line in result.stdout.strip().splitlines():
+            parts = [part.strip() for part in line.split(",")]
+            if len(parts) != 4:
+                continue
+            try:
+                limit, stock = float(parts[1]), float(parts[2])
+            except ValueError:
+                continue  # "[N/A]" on cards without power management
+            gpus.append({"name": parts[0], "limit_w": limit, "stock_w": stock,
+                         "max_sm_mhz": parts[3]})
+        return gpus or None
 
     def _verbose_probe(self) -> str:
         """One verbose ssh attempt, boiled down to how far the handshake got."""
@@ -457,7 +482,8 @@ print('finished from', ply)
     def upload_scripts(
         self, worker_dir: Path, log: Callable[[str], None] | None = None,
     ) -> None:
-        for filename in ("job.py", "pipeline.py", *EXTRA_WORKER_SCRIPTS):
+        for filename in ("job.py", "pipeline.py", "torch_env.py", "people_masks.py",
+                         *EXTRA_WORKER_SCRIPTS):
             source = worker_dir / filename
             if not source.is_file():
                 raise TransferError(f"Worker script is missing: {source}")
@@ -691,6 +717,20 @@ print('finished from', ply)
                 f"in {elapsed:.0f}s ({total * 8 / elapsed / 1_000_000:.1f} Mbps effective)."
             )
 
+    def upload_camera_groups(self, groups: dict[str, str], log: Callable[[str], None]) -> None:
+        """Tell the pod which photos came from which sub-folder; each is fitted as its own lens."""
+        descriptor, name = tempfile.mkstemp(prefix="camera-groups-", suffix=".json")
+        local = Path(name)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump({"groups": groups}, handle)
+            self._copy_file(
+                str(local), f"root@{self.host}:/workspace/job/camera_groups.json",
+                log, "Camera group list upload",
+            )
+        finally:
+            local.unlink(missing_ok=True)
+
     def fetch_drive_inputs(self, manifest: dict, log: Callable[[str], None]) -> None:
         """Give the pod a Drive file list plus a short-lived token; the pod fetches the photos."""
         descriptor, name = tempfile.mkstemp(prefix="drive-manifest-", suffix=".json")
@@ -726,16 +766,19 @@ print('finished from', ply)
         engine: str = "nerfstudio", spirula_version: str = "",
         spirula_floaters: str = "off", spirula_guidance: str = "off",
         spirula_distraction: str = "off",
-        spirula_depth_weight: float = 0.05, preview: bool = True,
+        spirula_depth_weight: float = 0.3, preview: bool = True,
         spirula_primitive: str = "3dgs", spirula_quality: str = "medium",
         spirula_vignetting: bool = False, spirula_object: bool = False,
         spirula_turntable: bool = False, spirula_main_scene: bool = False,
-        spirula_matcher: str = "sift",
-        steps_override: bool = True, fisheye: bool = False,
+        spirula_matcher: str = "sift", spirula_one_surface: bool = False,
+        spirula_people_masks: bool = False, steps_override: bool = True, fisheye: bool = False,
         fisheye_focal_mm: float = 7.5, sensor_width_mm: float = 23.5,
+        spirula_max_splats: int = 0,
     ) -> None:
         if spirula_quality not in {"low", "medium", "high", "ultra"}:
             raise TransferError(f"Unknown quality level: {spirula_quality}")
+        if spirula_max_splats and not 100_000 <= int(spirula_max_splats) <= 20_000_000:
+            raise TransferError("The splat limit must be between 100,000 and 20 million.")
         if spirula_primitive not in {"3dgs", "3dgut"}:
             raise TransferError(f"Unknown splat type: {spirula_primitive}")
         if fisheye and engine != "spirula":
@@ -776,11 +819,15 @@ print('finished from', ply)
                 f"PIPELINE_SPIRULA_DEPTH_WEIGHT={float(spirula_depth_weight):g} "
                 f"PIPELINE_SPIRULA_PRIMITIVE={spirula_primitive} "
                 f"PIPELINE_SPIRULA_QUALITY={spirula_quality} "
-                f"PIPELINE_SPIRULA_VIGNETTING={1 if spirula_vignetting else 0} "
+                + (f"PIPELINE_SPIRULA_MAX_SPLATS={int(spirula_max_splats)} "
+                   if spirula_max_splats else "")
+                + f"PIPELINE_SPIRULA_VIGNETTING={1 if spirula_vignetting else 0} "
                 f"PIPELINE_SPIRULA_OBJECT={1 if spirula_object else 0} "
                 f"PIPELINE_SPIRULA_TURNTABLE={1 if spirula_object and spirula_turntable else 0} "
                 f"PIPELINE_SPIRULA_MAIN_SCENE={1 if spirula_main_scene else 0} "
                 f"PIPELINE_SPIRULA_MATCHER={spirula_matcher} "
+                f"PIPELINE_SPIRULA_ONE_SURFACE={1 if spirula_one_surface else 0} "
+                f"PIPELINE_SPIRULA_PEOPLE_MASKS={1 if spirula_people_masks else 0} "
                 f"PIPELINE_STEPS_OVERRIDE={1 if steps_override else 0} "
                 if engine == "spirula" else ""
             )
@@ -808,34 +855,8 @@ print('finished from', ply)
         self, destination: Path, log: Callable[[str], None] | None = None,
     ) -> None:
         destination.mkdir(parents=True, exist_ok=True)
-        pending = []
-        for filename in ("gaussian_splat.ply", "pipeline_summary.json"):
-            target = destination / filename
-            temporary = destination / (filename + ".part")
-            temporary.unlink(missing_ok=True)
-            if log:
-                log(f"Downloading {filename}...")
-            remote = f"{REMOTE_OUTPUT_DIR}/{filename}"
-            info = self._remote_file_info(remote) if filename.endswith(".ply") else None
-            parallel_done = False
-            if info and info[0] >= PARALLEL_DOWNLOAD_MIN_BYTES:
-                try:
-                    self._download_parallel(remote, temporary, *info, log)
-                    parallel_done = True
-                except TransferError as exc:
-                    if log:
-                        log(f"Parallel download failed ({exc}); retrying with a single connection.")
-                    temporary.unlink(missing_ok=True)
-            if not parallel_done:
-                # Same progress meter as uploads: percent, size, speed and ETA.
-                self._scp_with_progress(
-                    [f"root@{self.host}:{remote}"], str(temporary), log, f"{filename} download",
-                )
-            if not temporary.is_file() or temporary.stat().st_size == 0:
-                raise TransferError(f"Download failed for {filename}: empty or missing file.")
-            pending.append((temporary, target))
-            if log:
-                log(f"Downloaded {filename} ({temporary.stat().st_size / 1024**2:.1f} MiB).")
+        pending = [self._download_one(destination, filename, log)
+                   for filename in ("gaussian_splat.ply", "pipeline_summary.json")]
         with pending[0][0].open("rb") as ply_file:
             if ply_file.read(4) != b"ply\n":
                 raise TransferError("Downloaded Gaussian splat is not a valid PLY file.")
@@ -845,6 +866,72 @@ print('finished from', ply)
             raise TransferError("Downloaded pipeline summary is invalid JSON.") from exc
         for temporary, target in pending:
             temporary.replace(target)
+        self._download_camera_solve(destination, log)
+        self._download_optional(
+            destination, "people_masks.jpg",
+            lambda path: path.read_bytes()[:3] == b"\xff\xd8\xff",
+            "The people-mask check sheet could not be downloaded", log)
+
+    def _download_one(
+        self, destination: Path, filename: str, log: Callable[[str], None] | None,
+    ) -> tuple[Path, Path]:
+        """Fetches one output file to <name>.part; returns (part, final path)."""
+        target = destination / filename
+        temporary = destination / (filename + ".part")
+        temporary.unlink(missing_ok=True)
+        if log:
+            log(f"Downloading {filename}...")
+        remote = f"{REMOTE_OUTPUT_DIR}/{filename}"
+        info = self._remote_file_info(remote) if filename.endswith((".ply", ".zip")) else None
+        parallel_done = False
+        if info and info[0] >= PARALLEL_DOWNLOAD_MIN_BYTES:
+            try:
+                self._download_parallel(remote, temporary, *info, log)
+                parallel_done = True
+            except TransferError as exc:
+                if log:
+                    log(f"Parallel download failed ({exc}); retrying with a single connection.")
+                temporary.unlink(missing_ok=True)
+        if not parallel_done:
+            # Same progress meter as uploads: percent, size, speed and ETA.
+            self._scp_with_progress(
+                [f"root@{self.host}:{remote}"], str(temporary), log, f"{filename} download",
+            )
+        if not temporary.is_file() or temporary.stat().st_size == 0:
+            raise TransferError(f"Download failed for {filename}: empty or missing file.")
+        if log:
+            log(f"Downloaded {filename} ({temporary.stat().st_size / 1024**2:.1f} MiB).")
+        return temporary, target
+
+    def _download_camera_solve(self, destination: Path, log: Callable[[str], None] | None) -> None:
+        """cameras.zip (the camera positions and 3D points of the solve), when the pod saved
+        one. Optional: older workers don't write it, and the splat is already safe, so a
+        failure here is only reported."""
+        self._download_optional(
+            destination, "cameras.zip", zipfile.is_zipfile,
+            "The camera positions could not be downloaded", log)
+
+    def _download_optional(
+        self, destination: Path, filename: str, valid: Callable[[Path], bool],
+        failure: str, log: Callable[[str], None] | None,
+    ) -> None:
+        """An extra output file, when the pod wrote one; a failure is only reported."""
+        remote = f"{REMOTE_OUTPUT_DIR}/{filename}"
+        try:
+            exists = self._ssh(f"test -s {shlex.quote(remote)}", timeout=60).returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            exists = False
+        if not exists:
+            return
+        try:
+            temporary, target = self._download_one(destination, filename, log)
+            if not valid(temporary):
+                raise TransferError(f"{filename} is not a valid file")
+            temporary.replace(target)
+        except TransferError as exc:
+            (destination / (filename + ".part")).unlink(missing_ok=True)
+            if log:
+                log(f"{failure} ({exc}); the splat is unaffected.")
 
     def _remote_file_info(self, remote: str) -> tuple[int, str] | None:
         """Size and MD5 of a file on the pod, or None if they cannot be read."""

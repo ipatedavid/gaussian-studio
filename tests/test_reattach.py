@@ -104,12 +104,41 @@ class RejoinAfterDropTests(unittest.TestCase):
         self.assertIn("Reconnected; the job is still going.", logs)
         self.assertIn("The pod finished the job on its own.", logs)
 
-    def test_an_unreachable_pod_keeps_the_original_error(self):
+    def test_an_unreachable_pod_is_given_up_on_only_after_the_long_wait(self):
         class Unreachable(FakeTransfer):
             def remote_job_state(self):
                 raise OSError("no route")
-        with self.assertRaises(ConnectionLostError):
-            self.rejoin(Unreachable([]))
+        with patch.object(job_controller, "REJOIN_GIVE_UP_SECONDS", 0):
+            with self.assertRaises(job_controller.PodUnreachableError):
+                self.rejoin(Unreachable([]))
+
+    def test_a_long_outage_is_ridden_out(self):
+        class Flaky(FakeTransfer):
+            failures = 12  # far more than the old limit of 8
+
+            def remote_job_state(self):
+                if Flaky.failures:
+                    Flaky.failures -= 1
+                    raise OSError("Network is unreachable")
+                return super().remote_job_state()
+        logs = self.rejoin(Flaky([state(True, True, False, 5600), state(False, False, True, 63000)]))
+        self.assertIn("Reconnected; the job is still going.", logs)
+        self.assertIn("The pod finished the job on its own.", logs)
+        self.assertTrue(any("attempt 12" in line for line in logs))
+
+    def test_a_second_drop_while_following_is_ridden_out_too(self):
+        class DropsLater(FakeTransfer):
+            calls = 0
+
+            def remote_job_state(self):
+                DropsLater.calls += 1
+                if 3 <= DropsLater.calls <= 10:
+                    raise OSError("Network is unreachable")
+                return super().remote_job_state()
+        logs = self.rejoin(DropsLater([state(True, True, False, 5600), state(True, True, False, 9000),
+                                       state(False, False, True, 63000)]))
+        self.assertIn("Reached the pod again.", logs)
+        self.assertIn("The pod finished the job on its own.", logs)
 
     def test_a_job_that_died_with_no_result_keeps_the_original_error(self):
         with self.assertRaises(ConnectionLostError):

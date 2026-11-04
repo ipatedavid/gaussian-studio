@@ -12,6 +12,48 @@ from config import AppConfig
 from job_controller import JobController
 
 
+def _offline_error():
+    import requests
+    from urllib3.exceptions import MaxRetryError, NameResolutionError
+    reason = NameResolutionError("api.runpod.io", None, OSError("Name or service not known"))
+    return requests.ConnectionError(MaxRetryError(None, "/graphql", reason))
+
+
+def _ok_response(data):
+    response = Mock(status_code=200)
+    response.raise_for_status.return_value = None
+    response.json.return_value = {"data": data}
+    return response
+
+
+class OfflineRetryTests(unittest.TestCase):
+    def setUp(self):
+        self.client = RunPodClient("test-key", "https://example.invalid/graphql")
+
+    def test_terminate_survives_a_short_network_drop(self):
+        self.client.session.request = Mock(side_effect=[
+            _offline_error(), _offline_error(), _ok_response({"podTerminate": None}),
+        ])
+        with patch("runpod_client.time.sleep"):
+            self.client.terminate_pod("pod1")
+        self.assertEqual(self.client.session.request.call_count, 3)
+
+    def test_gives_up_after_the_retry_window(self):
+        self.client.offline_retry_s = 0
+        self.client.session.request = Mock(side_effect=_offline_error())
+        with self.assertRaisesRegex(RunPodError, "Couldn't reach RunPod"):
+            self.client.terminate_pod("pod1")
+        self.assertEqual(self.client.session.request.call_count, 1)
+
+    def test_read_timeout_is_not_resent(self):
+        # The request may have reached RunPod; sending a creation again could double it.
+        import requests
+        self.client.session.request = Mock(side_effect=requests.ReadTimeout("slow"))
+        with self.assertRaises(RunPodError):
+            self.client.terminate_pod("pod1")
+        self.assertEqual(self.client.session.request.call_count, 1)
+
+
 class PodCreationSafetyTests(unittest.TestCase):
     def setUp(self):
         self.client = RunPodClient("test-key", "https://example.invalid/graphql")

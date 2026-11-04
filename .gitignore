@@ -25,4 +25,5 @@ desktop/runs.csv.tmp
 .DS_Store
 Thumbs.db
 web/.build/
+web/.update/
 web/site/

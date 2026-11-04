@@ -79,6 +79,29 @@ class InputPlan:
         return len(self.videos) or (1 if self.kind == "video" else 0)
 
     @property
+    def camera_groups(self) -> dict[str, str]:
+        """Photo name on the pod -> the sub-folder it came from, for sub-folder photos only.
+
+        Each sub-folder is fitted as its own camera (lens). Empty when every
+        photo is directly in the chosen folder.
+        """
+        if self.kind in {"drive", "drive_mixed"}:
+            return {item.dest: item.group for item in self.drive_files if getattr(item, "group", "")}
+        if self.kind in {"images", "mixed"}:
+            return {image.name: image.parent.name for image in self.images
+                    if image.parent != self.source}
+        return {}
+
+    @property
+    def photo_folders(self) -> tuple[str, ...]:
+        """Which photos to fetch again at job start: "" for the folder's own, then
+        sub-folder names; () when there are no sub-folder photos."""
+        groups = tuple(sorted(set(self.camera_groups.values())))
+        if not groups:
+            return ()
+        return (("",) if self.photo_count > len(self.camera_groups) else ()) + groups
+
+    @property
     def has_videos(self) -> bool:
         return self.kind in VIDEO_KINDS
 
@@ -174,6 +197,48 @@ def folder_photos(folder: Path) -> list[Path]:
         path for path in folder.iterdir()
         if path.is_file() and not path.is_symlink() and path.suffix.lower() in IMAGE_EXTENSIONS
     )
+
+
+def photo_subfolders(folder: Path) -> list[tuple[str, list[Path]]]:
+    """Sub-folders (one level down) holding photos, by name, with their photos.
+
+    Hidden folders and the app's own results folder are left out.
+    """
+    if not folder.is_dir():
+        return []
+    groups = []
+    for sub in sorted(folder.iterdir()):
+        if (sub.is_dir() and not sub.is_symlink() and not sub.name.startswith(".")
+                and sub.name != "results"):
+            photos = folder_photos(sub)
+            if photos:
+                groups.append((sub.name, photos))
+    return groups
+
+
+def pick_photos(folder: Path, photo_folders: tuple[str, ...] = ()) -> list[Path]:
+    """The photos of a job: the folder's own ("" in photo_folders) plus the named sub-folders.
+
+    No photo_folders means the folder's own photos only. Every photo goes into
+    one folder on the pod, so two photos may not share a name.
+    """
+    if not photo_folders:
+        return folder_photos(folder)
+    available = dict(photo_subfolders(folder))
+    photos: list[Path] = []
+    for group in photo_folders:
+        if group and group not in available:
+            raise ValueError(f"The sub-folder '{group}' has no photos any more.")
+        photos += available[group] if group else folder_photos(folder)
+    seen: dict[str, Path] = {}
+    for photo in photos:
+        other = seen.setdefault(photo.name.lower(), photo)
+        if other != photo:
+            raise ValueError(
+                f"{photo.name} is in two folders ({other.parent.name} and {photo.parent.name}); "
+                "rename one of them."
+            )
+    return photos
 
 
 def storage_from_sizes(sizes: list[int], minimum_volume_gb: int) -> tuple[int, int, int]:
@@ -337,10 +402,16 @@ def _plan_video(
 def plan_input(
     source: Path, kind: str, minimum_volume_gb: int,
     num_downscales: int, video_fps: float = DEFAULT_VIDEO_FPS,
-    more_videos: tuple[Path, ...] = (),
+    more_videos: tuple[Path, ...] = (), photo_folders: tuple[str, ...] = (),
 ) -> InputPlan:
     if kind == "images":
-        images = tuple(list_images(source))
+        if photo_folders:
+            images = tuple(pick_photos(source, photo_folders))
+            if len(images) < 3:
+                raise ValueError(
+                    f"Found {len(images)} supported images; at least three are required.")
+        else:
+            images = tuple(list_images(source))
         input_bytes, reserve, volume_gb = storage_plan(list(images), minimum_volume_gb)
         return InputPlan(kind, source, images, input_bytes, reserve, volume_gb)
     if kind != "video":

@@ -319,7 +319,7 @@ for name in ("high.mp4", "low.mov"):
 with patch("app.probe_video", return_value=VideoInfo(30, 1920, 1080, 30)), \
      patch("storage.probe_video", return_value=VideoInfo(30, 1920, 1080, 30)):
     window = studio.MainWindow()
-    assert window.local_mode.isChecked()
+    assert not window._drive()
     window.input_folder.setText(str(capture))
     window._local_folder_changed()
     rows = [window.capture_items.item(i).text() for i in range(window.capture_items.count())]

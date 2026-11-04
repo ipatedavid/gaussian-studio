@@ -48,13 +48,17 @@ class DriveFile:
     height: int = 0
     duration_ms: int = 0
     fps: float = 0.0
+    # Photos only: the sub-folder the photo is in ("" for the folder itself).
+    # Each sub-folder is fitted as its own camera (lens), e.g. close-ups shot
+    # at another focus distance.
+    group: str = ""
 
 
 @dataclass(frozen=True)
 class DriveListing:
     folder_id: str
     folder_name: str
-    files: tuple[DriveFile, ...]          # photos
+    files: tuple[DriveFile, ...]          # photos, sub-folder photos after the folder's own
     skipped: int = 0   # files that are neither photos nor videos
     videos: tuple[DriveFile, ...] = ()
 
@@ -234,12 +238,9 @@ class DriveClient:
             raise DriveError("That Google Drive item is not a folder.")
         return info["name"]
 
-    def list_images(self, folder_id: str, folder_name: str = "") -> DriveListing:
-        """Photos and videos directly inside the folder (subfolders are not searched)."""
-        _check_id(folder_id)
-        if not folder_name:
-            folder_name = self.folder_name(folder_id)
-        entries = self._list({
+    def _folder_entries(self, folder_id: str) -> list[dict]:
+        """Files (not folders) directly inside a folder."""
+        return self._list({
             **self._ALL, "corpora": "allDrives", "pageSize": 1000, "orderBy": "name",
             "q": f"'{folder_id}' in parents and trashed=false and mimeType!='{FOLDER_MIME}'",
             "fields": (
@@ -247,7 +248,20 @@ class DriveClient:
                 "videoMediaMetadata(width,height,durationMillis))"
             ),
         })
-        if not entries:
+
+    def list_images(self, folder_id: str, folder_name: str = "") -> DriveListing:
+        """Photos and videos directly inside the folder, plus the photos one sub-folder down.
+
+        Sub-folder photos carry the sub-folder's name as their group; deeper
+        folders and sub-folder videos are not searched.
+        """
+        _check_id(folder_id)
+        if not folder_name:
+            folder_name = self.folder_name(folder_id)
+        entries = self._folder_entries(folder_id)
+        subfolders = [folder for folder in self.list_folders(folder_id)
+                      if not folder.name.startswith(".")]
+        if not entries and not subfolders:
             # Drive answers "nothing" (not 404) for a folder this account cannot
             # see, so confirm access to give the right message.
             self.folder_name(folder_id)
@@ -257,15 +271,23 @@ class DriveClient:
             if not str(entry.get("size", "")).isdigit():
                 skipped += 1
             elif suffix in IMAGE_EXTENSIONS:
-                photos.append(entry)
+                photos.append((entry, ""))
             elif suffix in VIDEO_EXTENSIONS:
                 videos.append(entry)
             else:
                 skipped += 1
-        names = _unique_names([(p["id"], p["name"]) for p in photos])
+        for folder in subfolders:
+            photos += [
+                (entry, folder.name) for entry in self._folder_entries(folder.id)
+                if str(entry.get("size", "")).isdigit()
+                and Path(entry.get("name", "")).suffix.lower() in IMAGE_EXTENSIONS
+            ]
+        # Every photo lands in one folder on the pod, so names are unique across sub-folders.
+        names = _unique_names([(p["id"], p["name"]) for p, _ in photos])
         files = tuple(
-            DriveFile(p["id"], p["name"], names[p["id"]], int(p["size"]), p.get("md5Checksum", ""))
-            for p in photos
+            DriveFile(p["id"], p["name"], names[p["id"]], int(p["size"]), p.get("md5Checksum", ""),
+                      group=group)
+            for p, group in photos
         )
         return DriveListing(
             folder_id, folder_name, files, skipped,

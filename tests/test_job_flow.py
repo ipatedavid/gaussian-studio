@@ -57,6 +57,21 @@ class FakeRunPod:
         FakeRunPod.terminated.append(pod_id)
 
 
+class BlockedFirstRunPod(FakeRunPod):
+    """The first pod lands on a blocked host, the next on a good one."""
+    created = 0
+
+    def create_pod(self, **kwargs):
+        BlockedFirstRunPod.created += 1
+        FakeRunPod.last_create = kwargs
+        return PodInfo(pod_id=f"pod{BlockedFirstRunPod.created}", name="gaussian-" + kwargs["job_id"],
+                       status="RUNNING", cost_per_hour=0.22)
+
+    @staticmethod
+    def direct_ssh_endpoint(snapshot):
+        return ("99.69.17.69", 10692) if snapshot["id"] == "pod1" else ("203.0.113.5", 22022)
+
+
 class FakeScp:
     calls: list[tuple] = []
 
@@ -83,6 +98,9 @@ class FakeScp:
 
     def upload_videos(self, videos, reserve, log):
         FakeScp.calls.append(("upload_videos", tuple(video.name for video in videos)))
+
+    def upload_camera_groups(self, groups, log):
+        FakeScp.calls.append(("upload_camera_groups", dict(groups)))
 
     def fetch_drive_inputs(self, manifest, log):
         FakeScp.calls.append(("fetch_drive_inputs", manifest["kind"],
@@ -168,6 +186,69 @@ class JobFlowTests(unittest.TestCase):
         self.assertIn(("upload", 4), FakeScp.calls)
         self.assertTrue(job.results_dir.name.endswith(job.job_id[:6]))
         self.assertTrue((job.results_dir / "job.log").is_file())
+
+    def test_a_pod_on_a_blocked_host_is_let_go_and_another_tried(self):
+        BlockedFirstRunPod.created = 0
+        with patch("job_controller.RunPodClient", BlockedFirstRunPod), \
+                patch("job_controller.BLOCKED_HOST_PAUSE", 0):
+            job = self.make_job()
+            lines = []
+            job.log_line.connect(lines.append)
+            job._run_job(self.photos, ("A40", "SECURE"), wait_for_gpu=True)
+        self.assertEqual(job.outcome, "finished")
+        self.assertEqual(BlockedFirstRunPod.created, 2)
+        # the blocked one at once, the good one when the job finished
+        self.assertEqual(FakeRunPod.terminated, ["pod1", "pod2"])
+        self.assertTrue(any("landed on host 99.69.17.69" in line for line in lines))
+        self.assertEqual(self.ledger.entries()[0]["pod_id"], "pod2")
+
+    def test_without_waiting_a_blocked_host_ends_the_job(self):
+        BlockedFirstRunPod.created = 0
+        with patch("job_controller.RunPodClient", BlockedFirstRunPod):
+            job = self.make_job()
+            job._run_job(self.photos, ("A40", "SECURE"))
+        self.assertNotEqual(job.outcome, "finished")
+        self.assertEqual(BlockedFirstRunPod.created, 1)
+        self.assertEqual(FakeRunPod.terminated, ["pod1"])
+
+    def test_sub_folder_photos_are_sent_with_their_lens_group(self):
+        (self.photos / "close-up").mkdir()
+        for index in range(2):
+            (self.photos / "close-up" / f"c{index}.jpg").write_bytes(b"x" * 100)
+        job = self.make_job()
+        job._run_job(self.photos, ("A40", "SECURE"), engine="spirula",
+                     photo_folders=("", "close-up"))
+        self.assertEqual(job.outcome, "finished")
+        self.assertIn(("upload", 6), FakeScp.calls)
+        self.assertIn(("upload_camera_groups", {"c0.jpg": "close-up", "c1.jpg": "close-up"}),
+                      FakeScp.calls)
+
+    def test_plain_photo_job_sends_no_lens_groups(self):
+        (self.photos / "close-up").mkdir()
+        (self.photos / "close-up" / "c0.jpg").write_bytes(b"x" * 100)
+        job = self.make_job()
+        job._run_job(self.photos, ("A40", "SECURE"))
+        self.assertIn(("upload", 4), FakeScp.calls)
+        self.assertFalse(any(call[0] == "upload_camera_groups" for call in FakeScp.calls))
+
+    def test_a_pod_out_of_reach_for_too_long_is_kept_not_terminated(self):
+        import job_controller
+        from scp_client import ConnectionLostError
+
+        def dropped(self, *args, **kwargs):
+            raise ConnectionLostError("The SSH connection running the job dropped.")
+
+        def unreachable(self):
+            raise OSError("Network is unreachable")
+
+        job = self.make_job()
+        with patch.object(FakeScp, "run_pipeline", dropped, create=True), \
+                patch.object(FakeScp, "remote_job_state", unreachable, create=True), \
+                patch.object(job_controller, "REJOIN_GIVE_UP_SECONDS", 0):
+            job._run_job(self.photos, ("A40", "SECURE"))
+        self.assertEqual(job.outcome, "failed")
+        self.assertEqual(FakeRunPod.terminated, [])
+        self.assertEqual(self.ledger.entries()[0]["state"], "kept")
 
     def test_drive_video_job_fetches_on_the_pod(self):
         job = self.make_job()

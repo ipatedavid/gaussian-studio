@@ -7,49 +7,56 @@ surface containers instead of borders.
 from pathlib import Path
 
 # the combo box arrow: a stylesheet can only draw it from a file
-_CHEVRON_DOWN = (Path(__file__).resolve().parent / "assets" / "chevron-down.svg").as_posix()
+_ASSETS = Path(__file__).resolve().parent / "assets"
+_CHEVRON_DOWN = (_ASSETS / "chevron-down.svg").as_posix()
+_CHECK = (_ASSETS / "check.svg").as_posix()
+FONT_DIR = _ASSETS / "fonts"
 
 # ---- colour roles --------------------------------------------------------
-PRIMARY = "#ADC6FF"
-ON_PRIMARY = "#102F60"
-PRIMARY_CONTAINER = "#2B4678"
+# Neutral greys (no blue tint) with one soft blue accent; hairline borders
+# separate surfaces instead of heavy fills.
+PRIMARY = "#9DB8FF"
+ON_PRIMARY = "#0B1530"
+PRIMARY_CONTAINER = "#24345A"
 ON_PRIMARY_CONTAINER = "#D8E2FF"
-SECONDARY_CONTAINER = "#3E4759"
-ON_SECONDARY_CONTAINER = "#DAE2F9"
+SECONDARY_CONTAINER = "#2A2C33"
+ON_SECONDARY_CONTAINER = "#EDEDF0"
 TERTIARY_CONTAINER = "#573E5C"
 ERROR = "#FFB4AB"
-ERROR_CONTAINER = "#93000A"
+ERROR_CONTAINER = "#7A1A1A"
 ON_ERROR_CONTAINER = "#FFDAD6"
 SUCCESS = "#8DD5A6"
-SUCCESS_CONTAINER = "#1D4D33"
+SUCCESS_CONTAINER = "#1B3F2B"
 ON_SUCCESS_CONTAINER = "#A9F2C1"
 WARNING = "#F2C26B"
-WARNING_CONTAINER = "#5A4300"
+WARNING_CONTAINER = "#4A3A10"
 ON_WARNING_CONTAINER = "#FFDFA0"
-SURFACE = "#111318"
-SURFACE_CONTAINER_LOWEST = "#0C0E13"
-SURFACE_CONTAINER_LOW = "#191C20"
-SURFACE_CONTAINER = "#1D2024"
-SURFACE_CONTAINER_HIGH = "#282A2F"
-SURFACE_CONTAINER_HIGHEST = "#33353A"
-ON_SURFACE = "#E2E2E9"
-ON_SURFACE_VARIANT = "#C4C6D0"
-OUTLINE = "#8E9099"
-OUTLINE_VARIANT = "#44474F"
-HOVER_OVERLAY = "rgba(226, 226, 233, 0.08)"
-HOVER_OVERLAY_SOLID = "#24272C"
-PRIMARY_HOVER = "rgba(173, 198, 255, 0.10)"
-DISABLED_BG = "rgba(226, 226, 233, 0.12)"
-DISABLED_FG = "rgba(226, 226, 233, 0.38)"
+SURFACE = "#0E0F11"
+SURFACE_CONTAINER_LOWEST = "#0A0B0C"
+SURFACE_CONTAINER_LOW = "#151619"
+SURFACE_CONTAINER = "#1A1B1F"
+SURFACE_CONTAINER_HIGH = "#202126"
+SURFACE_CONTAINER_HIGHEST = "#1E1F24"
+ON_SURFACE = "#EDEDF0"
+ON_SURFACE_VARIANT = "#A3A3AD"
+OUTLINE = "#74747E"
+OUTLINE_VARIANT = "#2B2C31"
+BORDER = "rgba(255, 255, 255, 0.07)"
+BORDER_STRONG = "rgba(255, 255, 255, 0.14)"
+HOVER_OVERLAY = "rgba(255, 255, 255, 0.06)"
+HOVER_OVERLAY_SOLID = "#212227"
+PRIMARY_HOVER = "rgba(157, 184, 255, 0.10)"
+DISABLED_BG = "rgba(255, 255, 255, 0.08)"
+DISABLED_FG = "rgba(237, 237, 240, 0.35)"
 
-FONT_FAMILY = '"Noto Sans", "Roboto", "DejaVu Sans", sans-serif'
+FONT_FAMILY = '"Inter", "Noto Sans", "Roboto", "DejaVu Sans", sans-serif'
 MONO_FAMILY = '"Noto Sans Mono", "DejaVu Sans Mono", monospace'
 
 APP_STYLE = f"""
 QWidget {{
     color: {ON_SURFACE};
     font-family: {FONT_FAMILY};
-    font-size: 10pt;
+    font-size: 9.5pt;
 }}
 QMainWindow, QWidget#appRoot, QScrollArea#setupScroll, QScrollArea#setupScroll > QWidget > QWidget {{
     background: {SURFACE};
@@ -93,8 +100,8 @@ QToolButton#closeButton:hover {{
 }}
 QFrame#dialogSurface {{
     background: {SURFACE_CONTAINER_HIGH};
-    border: 1px solid {OUTLINE_VARIANT};
-    border-radius: 24px;
+    border: 1px solid {BORDER_STRONG};
+    border-radius: 16px;
 }}
 QLabel#dialogText {{
     color: {ON_SURFACE_VARIANT};
@@ -104,8 +111,8 @@ QLabel#dialogText {{
 /* ---- surfaces ---- */
 QFrame#card, QFrame#activityCard {{
     background: {SURFACE_CONTAINER_LOW};
-    border: none;
-    border-radius: 16px;
+    border: 1px solid {BORDER};
+    border-radius: 14px;
 }}
 QFrame#summaryBar {{
     background: {SURFACE_CONTAINER};
@@ -115,6 +122,7 @@ QFrame#summaryBar {{
 QFrame#sidebar {{
     background: {SURFACE_CONTAINER_LOW};
     border: none;
+    border-right: 1px solid {BORDER};
 }}
 QFrame#subtlePanel {{
     background: {SURFACE_CONTAINER};
@@ -124,12 +132,12 @@ QFrame#subtlePanel {{
 /* ---- type ---- */
 QLabel#brand, QLabel#pageTitle {{
     color: {ON_SURFACE};
-    font-size: 17pt;
-    font-weight: 500;
+    font-size: 16pt;
+    font-weight: 600;
 }}
 QLabel#cardTitle {{
     color: {ON_SURFACE};
-    font-size: 12pt;
+    font-size: 10.5pt;
     font-weight: 600;
 }}
 QLabel#sectionTitle {{
@@ -142,8 +150,8 @@ QLabel#muted, QLabel#helper {{
 }}
 QLabel#fieldLabel {{
     color: {ON_SURFACE_VARIANT};
-    font-size: 9pt;
-    font-weight: 600;
+    font-size: 9.5pt;
+    font-weight: 500;
 }}
 QLabel#eyebrow {{
     color: {PRIMARY};
@@ -211,72 +219,89 @@ QLabel#stageBadge[state="done"] {{
     color: {ON_SUCCESS_CONTAINER};
 }}
 
-/* ---- text fields (M3 filled) ---- */
+/* ---- text fields: rounded, hairline border ---- */
 QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {{
     background: {SURFACE_CONTAINER_HIGHEST};
     color: {ON_SURFACE};
-    border: none;
-    border-bottom: 1px solid {ON_SURFACE_VARIANT};
-    border-top-left-radius: 6px;
-    border-top-right-radius: 6px;
-    min-height: 22px;
-    padding: 8px 12px;
+    border: 1px solid {BORDER};
+    border-radius: 8px;
+    min-height: 20px;
+    padding: 6px 11px;
     selection-background-color: {PRIMARY_CONTAINER};
 }}
-QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {{
-    border-bottom: 2px solid {PRIMARY};
+QLineEdit:hover, QSpinBox:hover, QDoubleSpinBox:hover, QComboBox:hover {{
+    border-color: {BORDER_STRONG};
+}}
+QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus, QComboBox:on {{
+    border-color: {PRIMARY};
 }}
 QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled, QComboBox:disabled {{
     color: {DISABLED_FG};
-    border-bottom-color: {OUTLINE_VARIANT};
+    border-color: {BORDER};
 }}
-QComboBox::drop-down {{ border: none; width: 30px; }}
+QLineEdit[readOnly="true"] {{ color: {ON_SURFACE_VARIANT}; }}
+QComboBox {{ combobox-popup: 0; padding-right: 30px; }}
+QComboBox::drop-down {{ border: none; width: 28px; subcontrol-position: center right; }}
 QComboBox::down-arrow {{ image: url("{_CHEVRON_DOWN}"); width: 18px; height: 18px; }}
 QComboBox QAbstractItemView {{
-    background: {SURFACE_CONTAINER};
+    background: {SURFACE_CONTAINER_HIGH};
     color: {ON_SURFACE};
-    border: 1px solid {OUTLINE_VARIANT};
-    selection-background-color: {SECONDARY_CONTAINER};
+    border: 1px solid {BORDER_STRONG};
+    border-radius: 10px;
+    padding: 4px;
     outline: none;
 }}
-QCheckBox {{ spacing: 10px; }}
+QComboBox QAbstractItemView::item {{
+    min-height: 22px;
+    padding: 5px 10px;
+    border-radius: 6px;
+}}
+QComboBox QAbstractItemView::item:hover {{ background: {HOVER_OVERLAY}; }}
+QComboBox QAbstractItemView::item:selected {{ background: {SECONDARY_CONTAINER}; color: {ON_SURFACE}; }}
+QCheckBox {{ spacing: 9px; color: {ON_SURFACE}; }}
 QCheckBox::indicator {{
     width: 16px; height: 16px;
-    border: 2px solid {ON_SURFACE_VARIANT};
-    border-radius: 3px;
-    background: transparent;
+    border: 1px solid {BORDER_STRONG};
+    border-radius: 5px;
+    background: {SURFACE_CONTAINER_HIGHEST};
 }}
+QCheckBox::indicator:hover {{ border-color: {OUTLINE}; }}
 QCheckBox::indicator:checked {{
     background: {PRIMARY};
     border-color: {PRIMARY};
+    image: url("{_CHECK}");
 }}
+QCheckBox:disabled {{ color: {OUTLINE}; }}
+QCheckBox::indicator:disabled {{ border-color: {BORDER}; background: transparent; }}
+QCheckBox::indicator:checked:disabled {{ background: {OUTLINE_VARIANT}; border-color: {OUTLINE_VARIANT}; }}
 
 /* ---- buttons ---- */
 QPushButton {{
-    background: transparent;
-    color: {PRIMARY};
-    border: 1px solid {OUTLINE};
-    border-radius: 20px;
-    padding: 8px 20px;
-    min-height: 22px;
-    font-weight: 600;
+    background: {HOVER_OVERLAY};
+    color: {ON_SURFACE};
+    border: 1px solid {BORDER};
+    border-radius: 8px;
+    padding: 6px 14px;
+    min-height: 20px;
+    font-weight: 500;
 }}
-QPushButton:hover {{ background: {PRIMARY_HOVER}; }}
-QPushButton:disabled {{ color: {DISABLED_FG}; border-color: {DISABLED_BG}; }}
+QPushButton:hover {{ background: rgba(255, 255, 255, 0.10); border-color: {BORDER_STRONG}; }}
+QPushButton:disabled {{ color: {DISABLED_FG}; border-color: {BORDER}; background: transparent; }}
 QPushButton#primaryButton {{
     background: {PRIMARY};
     color: {ON_PRIMARY};
     border: none;
-    padding: 9px 24px;
+    padding: 8px 22px;
+    font-weight: 600;
 }}
-QPushButton#primaryButton:hover {{ background: #BFD2FF; }}
+QPushButton#primaryButton:hover {{ background: #B6CAFF; }}
 QPushButton#primaryButton:disabled {{ background: {DISABLED_BG}; color: {DISABLED_FG}; }}
 QPushButton#tonalButton {{
     background: {SECONDARY_CONTAINER};
     color: {ON_SECONDARY_CONTAINER};
-    border: none;
+    border: 1px solid {BORDER};
 }}
-QPushButton#tonalButton:hover {{ background: #4A5468; }}
+QPushButton#tonalButton:hover {{ background: #33363E; }}
 QPushButton#tonalButton:disabled {{ background: {DISABLED_BG}; color: {DISABLED_FG}; }}
 QPushButton#textButton {{
     background: transparent;
@@ -304,9 +329,9 @@ QPushButton#dangerButton:disabled {{ background: {DISABLED_BG}; color: {DISABLED
 QPushButton#fabButton {{
     background: {PRIMARY_CONTAINER};
     color: {ON_PRIMARY_CONTAINER};
-    border: none;
-    border-radius: 16px;
-    padding: 12px 18px;
+    border: 1px solid rgba(157, 184, 255, 0.18);
+    border-radius: 10px;
+    padding: 10px 16px;
     font-weight: 600;
 }}
 QPushButton#fabButton:hover {{ background: #355489; }}
@@ -349,14 +374,14 @@ QToolButton#segment:checked {{
     border-color: {SECONDARY_CONTAINER};
 }}
 QToolButton#helpButton {{
-    background: transparent;
-    color: {ON_SURFACE_VARIANT};
-    border: 1px solid {OUTLINE_VARIANT};
+    background: {HOVER_OVERLAY};
+    color: {OUTLINE};
+    border: none;
     border-radius: 8px;
-    min-width: 14px; max-width: 14px; min-height: 14px; max-height: 14px;
+    min-width: 16px; max-width: 16px; min-height: 16px; max-height: 16px;
     padding: 0px;
     font-size: 7.5pt;
-    font-weight: 700;
+    font-weight: 600;
 }}
 QToolButton#helpButton:hover {{
     color: {PRIMARY};
@@ -380,7 +405,8 @@ QListWidget#gpuList, QListWidget#jobList, QListWidget#navList {{
 }}
 QListWidget#gpuList::item {{
     background: {SURFACE_CONTAINER};
-    border-radius: 12px;
+    border: 1px solid {BORDER};
+    border-radius: 10px;
     margin: 3px 0px;
     padding: 10px 12px;
     color: {ON_SURFACE};
@@ -416,8 +442,9 @@ QListWidget#captureItems {{
     outline: none;
 }}
 QListWidget#captureItems::item {{
-    background: {SURFACE_CONTAINER};
-    border-radius: 10px;
+    background: {SURFACE_CONTAINER_HIGHEST};
+    border: 1px solid {BORDER};
+    border-radius: 8px;
     margin: 2px 0px;
     padding: 7px 10px;
     color: {ON_SURFACE};
@@ -425,13 +452,14 @@ QListWidget#captureItems::item {{
 QListWidget#captureItems::item:hover {{ background: {HOVER_OVERLAY_SOLID}; }}
 QListWidget#captureItems::indicator {{
     width: 16px; height: 16px;
-    border: 2px solid {ON_SURFACE_VARIANT};
-    border-radius: 3px;
-    background: transparent;
+    border: 1px solid {BORDER_STRONG};
+    border-radius: 5px;
+    background: {SURFACE_CONTAINER_HIGHEST};
 }}
 QListWidget#captureItems::indicator:checked {{
     background: {PRIMARY};
     border-color: {PRIMARY};
+    image: url("{_CHECK}");
 }}
 QFrame#jobCard {{ background: transparent; border: none; }}
 QLabel#jobTitle {{ color: {ON_SURFACE}; font-weight: 600; }}
@@ -491,17 +519,25 @@ QHeaderView::section {{
 
 /* ---- misc ---- */
 QToolTip {{
-    background: {ON_SURFACE};
-    color: {SURFACE};
-    border: none;
-    border-radius: 4px;
-    padding: 5px 8px;
+    background: {SURFACE_CONTAINER_HIGH};
+    color: {ON_SURFACE};
+    border: 1px solid {BORDER_STRONG};
+    border-radius: 8px;
+    padding: 7px 10px;
 }}
 QScrollBar:vertical {{ background: transparent; width: 10px; margin: 2px; }}
-QScrollBar::handle:vertical {{ background: {OUTLINE_VARIANT}; border-radius: 4px; min-height: 28px; }}
+QScrollBar::handle:vertical {{ background: {OUTLINE_VARIANT}; border-radius: 3px; min-height: 28px; margin: 0 2px; }}
 QScrollBar::handle:vertical:hover {{ background: {OUTLINE}; }}
 QScrollBar:horizontal {{ background: transparent; height: 10px; margin: 2px; }}
 QScrollBar::handle:horizontal {{ background: {OUTLINE_VARIANT}; border-radius: 4px; min-width: 28px; }}
 QScrollBar::add-line, QScrollBar::sub-line {{ width: 0px; height: 0px; }}
 QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
 """
+
+
+def load_fonts() -> None:
+    """Inter (SIL Open Font License, assets/fonts) for the whole app; the stylesheet falls back
+    to Noto Sans when the files are missing. Needs the QApplication to exist."""
+    from PySide6 import QtGui
+    for path in sorted(FONT_DIR.glob("*.ttf")):
+        QtGui.QFontDatabase.addApplicationFont(str(path))

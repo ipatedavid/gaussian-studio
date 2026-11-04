@@ -335,7 +335,7 @@ DIALOG_SCRIPT = r"""
 import sys, time
 sys.path.insert(0, sys.argv[1])
 from PySide6 import QtWidgets
-from drive_client import DriveFile, DriveListing
+from drive_client import DriveFile, DriveFolder, DriveListing
 from drive_dialog import DriveFolderDialog
 
 app = QtWidgets.QApplication([])
@@ -348,19 +348,27 @@ VIDEOS = (
 class Client:
     email = "sa@example.iam.gserviceaccount.com"
     def list_folders(self, parent):
-        return []
+        if parent is None:
+            return [DriveFolder("home", "gaussian-splat")]
+        return [DriveFolder("f1", "Garden")] if parent == "home" else []
     def list_images(self, folder_id, folder_name):
         return DriveListing(folder_id, folder_name, (), 0, VIDEOS)
 
+def wait(done):
+    deadline = time.time() + 5
+    while not done() and time.time() < deadline:
+        app.processEvents()
+        time.sleep(0.01)
+
 dialog = DriveFolderDialog(Client(), None, "f1", "Garden")
-deadline = time.time() + 5
-while not dialog.choose_button.isEnabled() and time.time() < deadline:
-    app.processEvents()
-    time.sleep(0.01)
-# A folder of only videos can be chosen; its videos are ticked on the New job page.
-assert dialog.choose_button.isEnabled()
-assert "3 videos" in dialog.status.text(), dialog.status.text()
-dialog._accept()
+# It opens on the folders inside gaussian-splat, with the last one used marked.
+wait(lambda: dialog.list.count())
+assert dialog.path_label.text() == "gaussian-splat", dialog.path_label.text()
+assert "current" in dialog.list.item(0).text(), dialog.list.item(0).text()
+# One click picks a folder; a folder of only videos can be chosen.
+dialog.list.itemClicked.emit(dialog.list.item(0))
+wait(lambda: dialog.selected is not None)
+assert dialog.result() == QtWidgets.QDialog.Accepted
 assert [v.id for v in dialog.selected.videos] == ["a", "b", "c"], dialog.selected
 print("OK")
 """

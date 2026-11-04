@@ -23,6 +23,8 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
+import torch_env
+
 try:  # guidance levels kept out of the public repo
     import extra_guidance
 except ImportError:
@@ -31,6 +33,8 @@ except ImportError:
 
 JOB_ROOT = Path("/workspace/job")
 INPUT_DIR = JOB_ROOT / "input"
+# Sent by the app when photos come from sub-folders: {"groups": {photo name: sub-folder}}.
+CAMERA_GROUPS_FILE = JOB_ROOT / "camera_groups.json"
 OUTPUT_DIR = JOB_ROOT / "output"
 PROCESSED_DIR = JOB_ROOT / "processed"
 TRAIN_OUTPUT_DIR = JOB_ROOT / "nerfstudio_outputs"
@@ -45,7 +49,7 @@ NUM_DOWNSCALES = int(
 # "nerfstudio" (COLMAP + Splatfacto) or "spirula" (Spirula Studio's built-in
 # SfM + trainer). Everything around the engine is shared.
 ENGINE = os.getenv("PIPELINE_ENGINE", "nerfstudio")
-SPIRULA_VERSION = os.getenv("PIPELINE_SPIRULA_VERSION", "2026.9.30")
+SPIRULA_VERSION = os.getenv("PIPELINE_SPIRULA_VERSION", "2026.10.30")
 # Optional full URL override for the Spirula Linux zip (mirror / pinned build).
 SPIRULA_URL = os.getenv("PIPELINE_SPIRULA_URL", "")
 SPIRULA_HOME = Path("/workspace/spirula")
@@ -69,6 +73,15 @@ SPIRULA_MAIN_SCENE = os.getenv("PIPELINE_SPIRULA_MAIN_SCENE", "0") == "1"
 # here (checked against Spirula's own sizes and SHA-256s) into the cache Spirula reads, so
 # its own downloader, which floods the log with progress bars, never runs.
 SPIRULA_MATCHER = os.getenv("PIPELINE_SPIRULA_MATCHER", "sift")
+# "One surface per pixel" (Spirula's depth- and normal-distortion terms) with guidance off.
+# They need no guidance maps, so people and other passers-by in the photos can't mislead
+# them; every guidance level already turns them on.
+SPIRULA_ONE_SURFACE = os.getenv("PIPELINE_SPIRULA_ONE_SURFACE", "0") == "1"
+# Mask people out of training (people_masks.py): passers-by can't turn into floaters or
+# ghosts, which matters most with depth guidance. Not for object scans, whose masks
+# already keep only the subject.
+SPIRULA_PEOPLE_MASKS = os.getenv("PIPELINE_SPIRULA_PEOPLE_MASKS", "0") == "1"
+PEOPLE_MASKS_SHEET = "people_masks.jpg"
 _GH = "https://github.com"
 SFM_MATCHERS = {
     "sift": ([], []),
@@ -106,7 +119,7 @@ SAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".exr", ".tif", ".tiff"
 SPIRULA_GUIDANCE = os.getenv("PIPELINE_SPIRULA_GUIDANCE", "off")
 GUIDANCE_LEVELS = ("off", "surfaces", "depth", *(extra_guidance.LEVELS if extra_guidance else ()))
 DEPTH_GUIDANCE = ("depth", *(extra_guidance.DEPTH_LEVELS if extra_guidance else ()))
-SPIRULA_DEPTH_WEIGHT = float(os.getenv("PIPELINE_SPIRULA_DEPTH_WEIGHT", "0.05"))
+SPIRULA_DEPTH_WEIGHT = float(os.getenv("PIPELINE_SPIRULA_DEPTH_WEIGHT", "0.3"))
 # Live training preview: both engines serve a web viewer on this pod port. The
 # app reaches it through an SSH tunnel; nothing is exposed publicly.
 PREVIEW = os.getenv("PIPELINE_PREVIEW", "1") == "1"
@@ -121,7 +134,7 @@ SPIRULA_QUALITY = os.getenv("PIPELINE_SPIRULA_QUALITY", "medium")
 # default leaves vignetting and the response curve out ("no_crf_no_vig").
 SPIRULA_VIGNETTING = os.getenv("PIPELINE_SPIRULA_VIGNETTING", "0") == "1"
 STEPS_OVERRIDE = os.getenv("PIPELINE_STEPS_OVERRIDE", "1") == "1"
-SPIRULA_PRESETS = {  # read from Spirula 2026.9.30's training configs
+SPIRULA_PRESETS = {  # read from Spirula's training configs (same in 2026.9.30 and 2026.10.30)
     "low": (15_000, 200_000),
     "medium": (30_000, 1_000_000),
     "high": (50_000, 3_000_000),
@@ -144,6 +157,14 @@ def scaled_steps(base: int, images: int | None) -> int:
         return base
     wanted = -(-base * images // STEP_REFERENCE_IMAGES // 1000) * 1000
     return min(int(base * MAX_STEP_SCALE), max(base, wanted))
+
+
+# A splat limit set by hand in the app (Spirula's --cap-max); 0 keeps the quality preset's.
+SPIRULA_MAX_SPLATS = int(os.getenv("PIPELINE_SPIRULA_MAX_SPLATS", "0"))
+
+
+def _splat_budget() -> int:
+    return SPIRULA_MAX_SPLATS or SPIRULA_PRESETS[SPIRULA_QUALITY][1]
 
 
 def _spirula_steps(images: int | None = None) -> int:
@@ -841,6 +862,34 @@ def _read_sparse(model: Path):
     return cameras, points
 
 
+def _save_camera_solve(dataset: Path) -> str | None:
+    """The camera solve, saved beside the splat as cameras.zip: the largest COLMAP model
+    (cameras, poses, 3D points) as sparse/0/, so the camera positions can be checked after
+    the pod is gone (COLMAP's GUI opens it). None when there is no model to save."""
+    roots = [dataset / "sparse", dataset / "colmap" / "sparse"]
+    models = [model for root in roots if root.is_dir() for model in root.iterdir()
+              if (model / "images.bin").is_file() or (model / "images.txt").is_file()]
+    if not models:
+        return None
+
+    def placed(model: Path) -> int:
+        if (model / "images.bin").is_file():
+            with (model / "images.bin").open("rb") as handle:
+                head = handle.read(8)
+            return struct.unpack("<Q", head)[0] if len(head) == 8 else 0
+        return _registered_images(model.parent.parent)
+
+    model = max(models, key=placed)
+    target = OUTPUT_DIR / "cameras.zip"
+    with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+        for path in sorted(model.iterdir()):
+            if path.is_file():
+                archive.write(path, f"sparse/0/{path.name}")
+    print(f"[pipeline] camera solve saved: {target.name} "
+          f"({placed(model)} cameras, {target.stat().st_size / 1024**2:.1f} MiB)", flush=True)
+    return target.name
+
+
 def _capture_stats(dataset: Path, images_dir: Path, image_count: int, registered: int) -> dict:
     """How well the photos were solved, for comparing runs later. Printed as a [stats] line."""
     stats: dict = {"images": image_count, "registered": registered}
@@ -1283,15 +1332,141 @@ def _spirula_object_masks(spirula: Path, dataset: Path) -> int:
     return written
 
 
-def _link_photos(destination: Path) -> None:
+def _spirula_people_masks(dataset: Path) -> dict | None:
+    """Mask the people in every placed photo into <dataset>/masks (people_masks.py).
+
+    Runs after the camera solve, whose angles tell real people from painted ones. Returns
+    the step's stats, or None when it failed: training then sees the whole photos.
+    """
+    print("[pipeline] masking people out of the photos", flush=True)
+    started = time.time()
+    stats: dict = {}
+    try:
+        python = torch_env.ensure(sys.modules[__name__])
+        run_command(
+            [str(python), str(Path(__file__).resolve().with_name("people_masks.py")), str(dataset),
+             "--check-sheet", str(OUTPUT_DIR / PEOPLE_MASKS_SHEET)],
+            cwd=JOB_ROOT,
+            env={"TORCH_HOME": "/workspace/torch"},
+        )
+        try:
+            stats = json.loads((dataset / "people_masks.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            stats = {}
+        if not _map_count(dataset / "masks"):
+            raise RuntimeError("no masks were written")
+    except RuntimeError as exc:
+        shutil.rmtree(dataset / "masks", ignore_errors=True)
+        print(f"[pipeline] WARNING: people masking failed ({exc}); training on the whole "
+              "photos, so passers-by may leave ghosts.", flush=True)
+        return None
+    print(f"[pipeline] people masked in {stats.get('with_people', '?')} of "
+          f"{stats.get('photos', '?')} photos "
+          f"({stats.get('masked_share', 0) * 100:.1f}% of the pixels), "
+          f"{time.time() - started:.0f}s", flush=True)
+    return stats
+
+
+def _input_photos() -> list[Path]:
+    return [path for path in sorted(INPUT_DIR.iterdir())
+            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS]
+
+
+def _link_photos(destination: Path, photos: list[Path] | None = None) -> None:
     """Spirula expects <dataset>/images. Hard links cost no extra disk space."""
-    for path in sorted(INPUT_DIR.iterdir()):
-        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS:
-            target = destination / path.name
-            try:
-                os.link(path, target)
-            except OSError:
-                shutil.copy2(path, target)
+    for path in _input_photos() if photos is None else photos:
+        target = destination / path.name
+        try:
+            os.link(path, target)
+        except OSError:
+            shutil.copy2(path, target)
+
+
+def _photo_labels() -> dict[str, str]:
+    """Photo name -> the sub-folder it came from, as the app sent it (sub-folder photos only)."""
+    if not CAMERA_GROUPS_FILE.is_file():
+        return {}
+    try:
+        groups = json.loads(CAMERA_GROUPS_FILE.read_text(encoding="utf-8"))["groups"]
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise RuntimeError(f"{CAMERA_GROUPS_FILE.name} is unreadable: {exc}") from exc
+    if not isinstance(groups, dict) or not all(
+            isinstance(key, str) and isinstance(value, str) and value
+            for key, value in groups.items()):
+        raise RuntimeError(f"{CAMERA_GROUPS_FILE.name} must map photo names to folder names.")
+    return groups
+
+
+def _stage_photo_groups(images_dir: Path, labels: dict[str, str]) -> list[str]:
+    """Link the photos into one folder per camera; returns the folder names.
+
+    The folder's own photos go to photos/, each sub-folder to photos_2/,
+    photos_3/... Focusing moves the lens, which changes the focal length, so
+    photos taken at another focus distance need their own camera in SfM.
+    """
+    by_label: dict[str, list[Path]] = {}
+    for photo in _input_photos():
+        by_label.setdefault(labels.get(photo.name, ""), []).append(photo)
+    folders, names = [], {}
+    for index, label in enumerate(sorted(by_label, key=lambda label: (label != "", label)), 1):
+        folder = "photos" if index == 1 else f"photos_{index}"
+        (images_dir / folder).mkdir(parents=True)
+        _link_photos(images_dir / folder, by_label[label])
+        folders.append(folder)
+        names[folder] = label
+        if labels:
+            print(f"[pipeline] camera {folder}: "
+                  + (f"sub-folder '{label}'" if label else "the folder's own photos")
+                  + f" ({len(by_label[label])} photos)", flush=True)
+    if labels:
+        SPIRULA_RESULT["photo_folders"] = names
+    return folders
+
+
+def _fitted_focals(dataset: Path) -> dict[str, tuple[float, int]]:
+    """Focal length (px) SfM fitted for each image folder, and how many of its
+    images it placed, from the largest binary model.
+
+    Folders sharing one camera report the same focal. Empty if the model
+    cannot be read.
+    """
+    params = {0: 3, 1: 4, 2: 4, 3: 5, 4: 8, 5: 8}
+    best: tuple[int, Path] | None = None
+    for model in (dataset / "sparse").glob("*"):
+        images_bin = model / "images.bin"
+        if (model / "cameras.bin").is_file() and images_bin.is_file():
+            with images_bin.open("rb") as handle:
+                head = handle.read(8)
+            if len(head) == 8 and (best is None or struct.unpack("<Q", head)[0] > best[0]):
+                best = (struct.unpack("<Q", head)[0], model)
+    if best is None:
+        return {}
+    try:
+        focals = {}
+        with (best[1] / "cameras.bin").open("rb") as handle:
+            (count,) = struct.unpack("<Q", handle.read(8))
+            for _ in range(count):
+                camera_id, model_id, _, _ = struct.unpack("<iiQQ", handle.read(24))
+                values = struct.unpack(f"<{params[model_id]}d", handle.read(8 * params[model_id]))
+                # Models with separate fx, fy (PINHOLE and up) report their mean.
+                focals[camera_id] = values[0] if model_id in {0, 2, 3} else (values[0] + values[1]) / 2
+        folders: dict[str, tuple[float, int]] = {}
+        with (best[1] / "images.bin").open("rb") as handle:
+            (count,) = struct.unpack("<Q", handle.read(8))
+            for _ in range(count):
+                camera_id = struct.unpack("<i7di", handle.read(64))[-1]
+                name = b""
+                while (char := handle.read(1)) not in (b"\0", b""):
+                    name += char
+                (points,) = struct.unpack("<Q", handle.read(8))
+                handle.seek(points * 24, os.SEEK_CUR)
+                folder = name.decode("utf-8", "replace").replace("\\", "/")
+                folder = folder.split("/")[0] if "/" in folder else ""
+                placed = folders.get(folder, (0.0, 0))[1] + 1
+                folders[folder] = (round(focals[camera_id], 1), placed)
+        return folders
+    except (OSError, KeyError, struct.error):
+        return {}
 
 
 def _input_photo_count() -> int:
@@ -1313,14 +1488,12 @@ def _run_spirula(videos: list[Path]) -> tuple[int, int, Path, float]:
     images_dir.mkdir(parents=True, exist_ok=True)
     sequences: list[str] = []
     camera_groups: list[str] = []
+    labels = _photo_labels() if SOURCE_TYPE in {"images", "mixed"} else {}
 
     if SOURCE_TYPE == "mixed":
         # Photos and video frames come from different cameras (or modes), so
         # each gets its own folder, and SfM fits one camera per folder.
-        photos_dir = images_dir / "photos"
-        photos_dir.mkdir()
-        _link_photos(photos_dir)
-        camera_groups.append("photos")
+        camera_groups += _stage_photo_groups(images_dir, labels)
     if SOURCE_TYPE in {"video", "mixed"}:
         # Several videos: each gets its own sub-folder, and SfM is told every
         # folder is one continuous sequence so it only chains frames within it
@@ -1355,8 +1528,14 @@ def _run_spirula(videos: list[Path]) -> tuple[int, int, Path, float]:
             data_type = "video"
     else:
         print("[pipeline] processing images with Spirula SfM", flush=True)
-        _link_photos(images_dir)
+        if labels:
+            camera_groups += _stage_photo_groups(images_dir, labels)
+        else:
+            _link_photos(images_dir)
         data_type = "individual"
+    # Several videos alone share one camera; photos beside video frames or
+    # photo sub-folders get one per folder.
+    per_folder = SOURCE_TYPE == "mixed" or bool(labels)
 
     image_count = _count_images(images_dir)
     if image_count < 3:
@@ -1393,8 +1572,9 @@ def _run_spirula(videos: list[Path]) -> tuple[int, int, Path, float]:
             "--data-type", data_type,
             *SFM_MATCHERS[SPIRULA_MATCHER][0],
             *[flag for name in sequences for flag in ("--sequence", name)],
-            *((_fisheye_sfm_args(images_dir, camera_groups) if SOURCE_TYPE == "mixed"
-               else _fisheye_sfm_args(images_dir)) if FISHEYE else []),
+            *((_fisheye_sfm_args(images_dir, camera_groups) if per_folder
+               else _fisheye_sfm_args(images_dir)) if FISHEYE
+              else ["--camera-mode", "folder"] if labels else []),
         ],
         cwd=JOB_ROOT,
         ok_exit_codes=(0, 3, SEGFAULT_EXIT),
@@ -1411,6 +1591,21 @@ def _run_spirula(videos: list[Path]) -> tuple[int, int, Path, float]:
               flush=True)
     registered = _registered_images(dataset)
     print(f"[pipeline] Spirula SfM registered {registered} of {image_count} images", flush=True)
+    if labels:
+        fitted = _fitted_focals(dataset)
+        SPIRULA_RESULT["fitted_focal_px"] = {folder: focal for folder, (focal, _) in fitted.items()}
+        base = fitted.get(camera_groups[0], (0.0, 0))[0]
+        for folder in camera_groups:
+            total = _count_images(images_dir / folder)
+            if folder not in fitted:
+                print(f"[pipeline] WARNING: SfM placed none of the {total} photos in {folder}",
+                      flush=True)
+                continue
+            focal, placed = fitted[folder]
+            change = (f" ({(focal / base - 1) * 100:+.1f}% vs {camera_groups[0]})"
+                      if base and folder != camera_groups[0] else "")
+            print(f"[pipeline] fitted focal length, {folder}: {focal:.1f} px{change}; "
+                  f"placed {placed} of {total} photos", flush=True)
     if registered < 3 or registered < MIN_REGISTERED_FRACTION * image_count:
         stronger = {
             "sift": " Repetitive or shiny subjects (identical rods, tiles, windows) often split "
@@ -1428,6 +1623,12 @@ def _run_spirula(videos: list[Path]) -> tuple[int, int, Path, float]:
         SPIRULA_RESULT["main_scene"] = _write_main_scene_region(dataset)
     if SPIRULA_OBJECT and not SPIRULA_TURNTABLE:
         SPIRULA_RESULT["object_masks"] = _spirula_object_masks(spirula, dataset)
+    if SPIRULA_PEOPLE_MASKS:
+        if SPIRULA_OBJECT:
+            print("[pipeline] people masking skipped: object scans already keep only the "
+                  "subject", flush=True)
+        else:
+            SPIRULA_RESULT["people_masks"] = _spirula_people_masks(dataset)
     steps = _spirula_steps(registered)
     base = SPIRULA_PRESETS[SPIRULA_QUALITY][0]
     if not STEPS_OVERRIDE and steps > base:
@@ -1453,6 +1654,11 @@ def _run_spirula(videos: list[Path]) -> tuple[int, int, Path, float]:
         ]
         if guidance == "off":
             cleanup += ["--load-normals", "0", "--load-depths", "0"]
+            if SPIRULA_ONE_SURFACE:
+                cleanup += [
+                    "--depth-distortion-reg", SPIRULA_DISTORTION_REG,
+                    "--normal-distortion-reg", SPIRULA_DISTORTION_REG,
+                ]
         else:
             cleanup += [
                 "--depth-distortion-reg", SPIRULA_DISTORTION_REG,
@@ -1466,9 +1672,11 @@ def _run_spirula(videos: list[Path]) -> tuple[int, int, Path, float]:
                 cleanup += extra_guidance.train_flags(guidance, dataset)
         print(
             f"[pipeline] starting Spirula training for {steps} iterations "
-            f"(quality: {SPIRULA_QUALITY}, up to {SPIRULA_PRESETS[SPIRULA_QUALITY][1]:,} splats; "
+            f"(quality: {SPIRULA_QUALITY}, up to {_splat_budget():,} splats; "
             f"floater suppression: {SPIRULA_FLOATERS}; ignore moving things: "
-            f"{SPIRULA_DISTRACTION}; guidance: {guidance})",
+            f"{SPIRULA_DISTRACTION}; guidance: {guidance}"
+            + ("; one surface per pixel" if guidance == "off" and SPIRULA_ONE_SURFACE else "")
+            + ")",
             flush=True,
         )
         with _VramMonitor() as vram:
@@ -1485,6 +1693,7 @@ def _run_spirula(videos: list[Path]) -> tuple[int, int, Path, float]:
                     "--output-dir-prefix", str(TRAIN_OUTPUT_DIR),
                     "--output-dir-name", SPIRULA_RUN_NAME,
                     "--quality", SPIRULA_QUALITY,
+                    *(["--cap-max", str(SPIRULA_MAX_SPLATS)] if SPIRULA_MAX_SPLATS else []),
                     *(["--ppisp-param-type", "no_crf"] if SPIRULA_VIGNETTING else []),
                     "--num-iterations", str(steps),
                     "--primitive", SPIRULA_PRIMITIVE,
@@ -2007,6 +2216,8 @@ def run_pipeline() -> None:
         raise RuntimeError(f"Depth guidance strength must be 0 to 1, got {SPIRULA_DEPTH_WEIGHT}")
     if SPIRULA_QUALITY not in SPIRULA_PRESETS:
         raise RuntimeError(f"Unknown quality level: {SPIRULA_QUALITY}")
+    if SPIRULA_MAX_SPLATS and not 100_000 <= SPIRULA_MAX_SPLATS <= 20_000_000:
+        raise RuntimeError(f"The splat limit must be 100,000 to 20 million, got {SPIRULA_MAX_SPLATS:,}.")
     if SPIRULA_PRIMITIVE not in {"3dgs", "3dgut"}:
         raise RuntimeError(f"Unknown splat type: {SPIRULA_PRIMITIVE}")
     if SPIRULA_OBJECT and ENGINE != "spirula":
@@ -2050,6 +2261,9 @@ def run_pipeline() -> None:
             raise RuntimeError(
                 f"Only {image_count} images found; COLMAP needs several overlapping views."
             )
+        if ENGINE != "spirula" and CAMERA_GROUPS_FILE.is_file():
+            print("[pipeline] note: Nerfstudio fits one camera for all photos; "
+                  "sub-folders only get their own lens fit with Spirula Studio", flush=True)
     else:
         raise RuntimeError(f"Unknown input type: {SOURCE_TYPE}")
 
@@ -2073,6 +2287,11 @@ def run_pipeline() -> None:
 
     destination = OUTPUT_DIR / "gaussian_splat.ply"
     shutil.copy2(source_ply, destination)
+    try:
+        camera_solve = _save_camera_solve(PROCESSED_DIR)
+    except (OSError, struct.error, zipfile.BadZipFile) as exc:
+        print(f"[pipeline] note: the camera solve could not be saved ({exc})", flush=True)
+        camera_solve = None
 
     summary = {
         "pipeline": "spirula-studio" if ENGINE == "spirula" else "nerfstudio-splatfacto",
@@ -2085,6 +2304,7 @@ def run_pipeline() -> None:
         "video_fps": VIDEO_FPS if SOURCE_TYPE in {"video", "mixed"} else None,
         "max_iterations": SPIRULA_RESULT.get("steps") if ENGINE == "spirula" else MAX_STEPS,
         "spirula_quality": SPIRULA_QUALITY if ENGINE == "spirula" else None,
+        "spirula_max_splats": _splat_budget() if ENGINE == "spirula" else None,
         "spirula_vignetting_corrected": SPIRULA_VIGNETTING if ENGINE == "spirula" else None,
         "num_downscales": NUM_DOWNSCALES if ENGINE == "nerfstudio" else None,
         "spirula_version": SPIRULA_VERSION if ENGINE == "spirula" else None,
@@ -2095,10 +2315,17 @@ def run_pipeline() -> None:
         "spirula_main_scene": SPIRULA_RESULT.get("main_scene") if ENGINE == "spirula" else None,
         "spirula_feature_matching": SPIRULA_MATCHER if ENGINE == "spirula" else None,
         "spirula_object_masks": SPIRULA_RESULT.get("object_masks") if ENGINE == "spirula" else None,
+        "spirula_people_masks": (
+            SPIRULA_RESULT.get("people_masks") or False
+            if ENGINE == "spirula" and SPIRULA_PEOPLE_MASKS and not SPIRULA_OBJECT else None
+        ),
         "spirula_guidance_requested": SPIRULA_GUIDANCE if ENGINE == "spirula" else None,
         "spirula_guidance_used": SPIRULA_RESULT.get("guidance_used") if ENGINE == "spirula" else None,
         "spirula_guidance_salvaged": bool(SPIRULA_RESULT.get("guidance_salvaged")) if ENGINE == "spirula" else None,
         "spirula_primitive": SPIRULA_PRIMITIVE if ENGINE == "spirula" else None,
+        "spirula_one_surface": (
+            SPIRULA_ONE_SURFACE or SPIRULA_RESULT.get("guidance_used", "off") != "off"
+        ) if ENGINE == "spirula" else None,
         "capture": SPIRULA_RESULT.get("capture") if ENGINE == "spirula" else None,
         "fisheye": (
             {"focal_mm": FISHEYE_FOCAL_MM, "sensor_width_mm": SENSOR_WIDTH_MM,
@@ -2109,6 +2336,7 @@ def run_pipeline() -> None:
             if ENGINE == "spirula" and SPIRULA_RESULT.get("guidance_used") in DEPTH_GUIDANCE
             else None
         ),
+        "camera_solve": camera_solve,
         "training_seconds": round(training_seconds, 3),
         "training_vram": TRAINING_VRAM or None,
         "ply": str(destination),

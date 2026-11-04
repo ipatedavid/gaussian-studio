@@ -12,7 +12,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from config import (
     DEFAULT_SPIRULA_IMAGE, DEPTH_GUIDANCE, ENGINE_LABELS, EXTRA_GUIDANCE, GUIDANCE_LABELS,
-    MAX_STEP_SCALE, QUALITY_LEVELS, PHOTOS_ITEM, STEP_REFERENCE_IMAGES, AppConfig, DriveKeyError, install_drive_key,
+    MAX_SPLATS, MAX_STEP_SCALE, MIN_SPLATS, QUALITY_LEVELS, PHOTOS_ITEM, STEP_REFERENCE_IMAGES, AppConfig, DriveKeyError, install_drive_key,
     quality_steps, service_account_email, write_env_value,
 )
 from drive_client import DriveClient, DriveError, DriveFile, DriveListing
@@ -22,6 +22,7 @@ from job_controller import JobController
 from job_manager import JobManager
 from storage import (
     GIB, MAX_VIDEO_FPS, MIB, MIN_VIDEO_FPS, InputPlan, VideoInfo, folder_photos, list_videos,
+    photo_subfolders,
     plan_drive_input, plan_drive_mixed, plan_drive_video, plan_input, plan_mixed, probe_video,
 )
 import ui_theme as theme
@@ -109,14 +110,6 @@ def field(title: str, widget: QtWidgets.QWidget, *tip: str) -> QtWidgets.QWidget
     return container
 
 
-def segment(text: str) -> QtWidgets.QToolButton:
-    button = QtWidgets.QToolButton()
-    button.setText(text)
-    button.setObjectName("segment")
-    button.setCheckable(True)
-    return button
-
-
 FLOATER_HELP = {
     "off": "Off: trains exactly as before. Keep this for a baseline to compare against.",
     "mild": "Mild: removes most stray blobs and see-through patches. A safe first thing to try.",
@@ -174,23 +167,116 @@ GUIDANCE_HELP = {
 }
 
 
-def segment_row(options: tuple[tuple[str, str], ...], parent) -> tuple[QtWidgets.QHBoxLayout, dict]:
-    row = QtWidgets.QHBoxLayout()
-    row.setSpacing(8)
-    group = QtWidgets.QButtonGroup(parent)
-    group.setExclusive(True)
-    buttons = {}
+# Every dropdown is this wide, so the settings line up in one column.
+CONTROL_WIDTH = 300
+
+
+def choice(options: tuple[tuple[str, str], ...], tips: dict | None = None) -> QtWidgets.QComboBox:
+    """A dropdown of (key, text) options; `tips` explains an option when hovered in the list."""
+    box = QtWidgets.QComboBox()
+    box.setFixedWidth(CONTROL_WIDTH)
+    # A list view lets the stylesheet pad and round the rows; a frameless, see-through popup
+    # window lets the list's rounded corners show.
+    box.setView(QtWidgets.QListView())
+    box.view().setSpacing(1)
+    popup = box.view().window()
+    popup.setWindowFlags(popup.windowFlags() | QtCore.Qt.FramelessWindowHint
+                         | QtCore.Qt.NoDropShadowWindowHint)
+    popup.setAttribute(QtCore.Qt.WA_TranslucentBackground)
     for key, text in options:
-        button = segment(text)
-        group.addButton(button)
-        row.addWidget(button)
-        buttons[key] = button
-    row.addStretch(1)
-    return row, buttons
+        box.addItem(text, key)
+        if tips and tips.get(key):
+            box.setItemData(box.count() - 1, tip_html(tips[key]), QtCore.Qt.ToolTipRole)
+    return box
 
 
-def checked_key(buttons: dict, default: str) -> str:
-    return next((key for key, button in buttons.items() if button.isChecked()), default)
+def chosen(box: QtWidgets.QComboBox, default: str) -> str:
+    return box.currentData() or default
+
+
+def choose(box: QtWidgets.QComboBox, key: str) -> None:
+    index = box.findData(key)
+    if index >= 0:
+        box.setCurrentIndex(index)
+
+
+def inline(*widgets: QtWidgets.QWidget) -> QtWidgets.QWidget:
+    """Controls side by side, left-aligned."""
+    row = QtWidgets.QWidget()
+    layout = QtWidgets.QHBoxLayout(row)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(8)
+    for widget in widgets:
+        layout.addWidget(widget)
+    layout.addStretch(1)
+    return row
+
+
+class FormGrid:
+    """Settings as rows: the name (with its '?') on the left, the control on the right.
+    A row's name and control show and hide together."""
+
+    LABEL_WIDTH = 170
+
+    def __init__(self, layout: QtWidgets.QBoxLayout):
+        self.grid = QtWidgets.QGridLayout()
+        self.grid.setContentsMargins(0, 0, 0, 0)
+        self.grid.setHorizontalSpacing(16)
+        self.grid.setVerticalSpacing(10)
+        self.grid.setColumnMinimumWidth(0, self.LABEL_WIDTH)
+        self.grid.setColumnStretch(1, 1)
+        layout.addLayout(self.grid)
+        self.rows: dict[str, tuple[QtWidgets.QWidget, QtWidgets.QWidget]] = {}
+        self._next = 0
+
+    def add(self, key: str, title: str, widget: QtWidgets.QWidget, *tip: str) -> None:
+        name = titled(title, *tip)
+        self.grid.addWidget(name, self._next, 0, QtCore.Qt.AlignVCenter)
+        self.grid.addWidget(widget, self._next, 1)
+        self.rows[key] = (name, widget)
+        self._next += 1
+
+    def span(self, widget: QtWidgets.QWidget) -> None:
+        """A row across both columns (a block with its own FormGrid lines up with this one)."""
+        self.grid.addWidget(widget, self._next, 0, 1, 2)
+        self._next += 1
+
+    def wide(self, widget: QtWidgets.QWidget) -> None:
+        """A row without a name, under the controls (checkboxes, notices)."""
+        self.grid.addWidget(widget, self._next, 1)
+        self._next += 1
+
+    def show(self, key: str, visible: bool) -> None:
+        for widget in self.rows[key]:
+            widget.setVisible(visible)
+
+
+# What the capture is of: the whole place, only its main part, or one object.
+SUBJECTS = {
+    "scene": ("Whole scene", "everything the photos show is trained, surroundings included."),
+    "main": ("Main scene only", (
+        "after the camera positions are solved, the pod works out the main scene (a cylinder "
+        "around what you circled, or a box around the bulk of the scene) and trains only there. "
+        "Sky and far buildings are left out from the start: a compact splat with a clean edge.")),
+    "object": ("Object: cut away the background", (
+        "for one thing on a table, photographed in rings all the way round. An AI model "
+        "(BiRefNet) masks out the table and the room in every photo, and Spirula trains with its "
+        "object preset. Keep a patterned surface under the object: it is what places the photos. "
+        "About 2–3 extra minutes on the pod.")),
+    "turntable": ("Object on a turntable", (
+        "the object was turned while the camera stayed put. The background is masked out "
+        "before the camera positions are worked out, so the still background can't confuse "
+        "them; if masking fails, the job stops before training. Keep the light soft and even.")),
+}
+MATCHER_HELP = {
+    "sift": ("Standard (SIFT): the classic method. Fast, nothing to download. Fine for most "
+             "rooms, objects and outdoor scenes."),
+    "aliked": ("Learned (ALIKED + LightGlue): AI features and matching. Much better at repetitive "
+               "or shiny subjects, and at joining passes shot from different heights. Camera "
+               "solving takes roughly 10–15 minutes longer."),
+    "loma": ("LoMa: the newest matcher (2026), built for the hardest pairs. Downloads about "
+             "1.4 GB on each pod and solves slowest. Promising, but not yet widely compared."),
+}
 
 
 def repolish(widget: QtWidgets.QWidget) -> None:
@@ -1081,6 +1167,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.resize(1360, 840)
         # Small enough for a quarter-screen tile; pages scroll when shorter.
         self.setMinimumSize(600, 400)
+        theme.load_fonts()
         self.setStyleSheet(APP_STYLE)
         self._resizer = EdgeResizer(self)
         self._auto_gpu_timer = QtCore.QTimer(self)
@@ -1269,50 +1356,44 @@ class MainWindow(QtWidgets.QMainWindow):
         left = QtWidgets.QVBoxLayout()
         left.setSpacing(16)
 
+        # Left: the settings, in the order the pod works through them. Right: the GPU and a
+        # summary of the job. Every setting is visible; choices are dropdowns.
         source_card, source_layout = card("Capture")
-        source_modes = QtWidgets.QHBoxLayout()
-        source_modes.setSpacing(8)
-        self.local_mode = segment("Local")
-        self.drive_mode = segment("Google Drive")
-        self.mode_group = QtWidgets.QButtonGroup(self)
-        self.mode_group.setExclusive(True)
-        for button in (self.local_mode, self.drive_mode):
-            self.mode_group.addButton(button)
-            source_modes.addWidget(button)
-        source_modes.addStretch(1)
-        source_layout.addLayout(source_modes)
-
+        source_form = FormGrid(source_layout)
+        self.source_kind = choice((("local", "This computer"), ("drive", "Google Drive")))
+        source_form.add("source", "Source", inline(self.source_kind),
+                        "Photos and videos in a folder on this computer, or in a Google Drive "
+                        "folder that the pod downloads straight from Google.")
+        self.source_form = source_form
         self.source_pages = QtWidgets.QStackedWidget()
-        local_page = QtWidgets.QWidget()
-        local_layout = QtWidgets.QHBoxLayout(local_page)
-        local_layout.setContentsMargins(0, 0, 0, 0)
-        local_layout.setSpacing(8)
         self.input_folder = QtWidgets.QLineEdit()
         self.input_folder.setPlaceholderText("Folder with the photos and/or videos")
         self.input_folder.setToolTip(
             "Photos and videos directly in this folder are listed below; untick what to "
             "leave out. Photos and videos together become one splat."
         )
-        local_layout.addWidget(self.input_folder, 1)
-        local_browse = QtWidgets.QPushButton("Choose folder")
+        local_browse = QtWidgets.QPushButton("Choose")
         local_browse.clicked.connect(self._browse_local)
+        local_page = QtWidgets.QWidget()
+        local_layout = QtWidgets.QHBoxLayout(local_page)
+        local_layout.setContentsMargins(0, 0, 0, 0)
+        local_layout.setSpacing(8)
+        local_layout.addWidget(self.input_folder, 1)
         local_layout.addWidget(local_browse)
         self.source_pages.addWidget(local_page)
-
-        drive_page = QtWidgets.QWidget()
-        drive_layout = QtWidgets.QVBoxLayout(drive_page)
-        drive_layout.setContentsMargins(0, 0, 0, 0)
-        drive_layout.setSpacing(9)
         self.drive_selection = QtWidgets.QLineEdit()
         self.drive_selection.setReadOnly(True)
         self.drive_selection.setPlaceholderText("No Google Drive folder selected")
-        drive_row = QtWidgets.QHBoxLayout()
-        drive_row.setSpacing(8)
-        drive_row.addWidget(self.drive_selection, 1)
-        self.drive_browse = QtWidgets.QPushButton("Choose folder")
+        self.drive_browse = QtWidgets.QPushButton("Choose")
         self.drive_browse.clicked.connect(self._browse_drive)
-        drive_row.addWidget(self.drive_browse)
-        drive_layout.addLayout(drive_row)
+        drive_page = QtWidgets.QWidget()
+        drive_layout = QtWidgets.QHBoxLayout(drive_page)
+        drive_layout.setContentsMargins(0, 0, 0, 0)
+        drive_layout.setSpacing(8)
+        drive_layout.addWidget(self.drive_selection, 1)
+        drive_layout.addWidget(self.drive_browse)
+        self.source_pages.addWidget(drive_page)
+        source_form.add("folder", "Folder", self.source_pages)
         self.results_folder = QtWidgets.QLineEdit()
         self.results_folder.setPlaceholderText(str(self.config.results_root()))
         results_widget = QtWidgets.QWidget()
@@ -1320,16 +1401,14 @@ class MainWindow(QtWidgets.QMainWindow):
         results_row.setContentsMargins(0, 0, 0, 0)
         results_row.setSpacing(8)
         results_row.addWidget(self.results_folder, 1)
-        results_browse = QtWidgets.QPushButton("Browse")
+        results_browse = QtWidgets.QPushButton("Choose")
         results_browse.clicked.connect(self._browse_results)
         results_row.addWidget(results_browse)
-        drive_layout.addWidget(field(
-            "Save results to", results_widget,
+        source_form.add(
+            "results", "Save results to", results_widget,
             "Results are saved on this computer. The pod downloads your files straight from "
             "Google; nothing is uploaded from here.",
-        ))
-        self.source_pages.addWidget(drive_page)
-        source_layout.addWidget(self.source_pages)
+        )
 
         # What's in the chosen folder: one row for all its photos, one per video.
         self.capture_items = QtWidgets.QListWidget()
@@ -1338,58 +1417,50 @@ class MainWindow(QtWidgets.QMainWindow):
         self.capture_items.setFocusPolicy(QtCore.Qt.NoFocus)
         self.capture_items.setToolTip("Untick anything to leave it out of this job.")
         self.capture_items.hide()
-        source_layout.addWidget(self.capture_items)
+        source_form.wide(self.capture_items)
 
+        # Videos only: its own row, shown when the capture has a video.
         self.frames_box = QtWidgets.QWidget()
-        frames_layout = QtWidgets.QVBoxLayout(self.frames_box)
-        frames_layout.setContentsMargins(0, 0, 0, 0)
-        frames_layout.setSpacing(8)
-        frame_row = QtWidgets.QWidget()
-        frame_layout = QtWidgets.QHBoxLayout(frame_row)
-        frame_layout.setContentsMargins(0, 0, 0, 0)
-        frame_layout.setSpacing(8)
+        frames_form = FormGrid(QtWidgets.QVBoxLayout(self.frames_box))
         self.video_fps = QtWidgets.QDoubleSpinBox()
         self.video_fps.setRange(MIN_VIDEO_FPS, MAX_VIDEO_FPS)
         self.video_fps.setDecimals(1)
         self.video_fps.setSingleStep(0.5)
         self.video_fps.setSuffix(" fps")
         self.video_fps.setToolTip("Frames taken per second of video, across the whole video.")
-        frame_layout.addWidget(self.video_fps)
         self.frame_fps_label = QtWidgets.QLabel("")
         self.frame_fps_label.setToolTip("Frames the pod will take from all the videos together.")
-        frame_layout.addWidget(self.frame_fps_label)
-        frame_layout.addStretch(1)
-        frames_layout.addWidget(field(
-            "Frames per second", frame_row,
+        frames_form.add(
+            "fps", "Frames per second", inline(self.video_fps, self.frame_fps_label),
             "How many frames to take from each second of video, from start to end. "
             "3 suits a slow walk; use 2 for a small room, more if you moved quickly. "
             "More frames means longer camera solving on the pod.",
-        ))
+        )
         self.frames_notice = label(
             "More frames than training can use well. Consider a lower fps.", "notice")
         self.frames_notice.setWordWrap(True)
         self.frames_notice.hide()
-        frames_layout.addWidget(self.frames_notice)
-        source_layout.addWidget(self.frames_box)
+        frames_form.wide(self.frames_notice)
+        self.frames_box.layout().setContentsMargins(0, 0, 0, 0)
+        source_form.span(self.frames_box)
+        self.subject = choice(tuple((key, text) for key, (text, _tip) in SUBJECTS.items()),
+                              {key: tip for key, (_text, tip) in SUBJECTS.items()})
+        source_form.add("subject", "Subject", inline(self.subject),
+                         *(f"{text}: {tip}" for text, tip in SUBJECTS.values()))
+        self.source_preview = label("Choose an input to see its size and storage estimate.", "helper")
+        source_layout.addWidget(self.source_preview)
+        self.results_hint = label("", "helper")  # shown as the preview's tooltip
+        left.addWidget(source_card)
 
-        self.fisheye_box = QtWidgets.QWidget()
-        fisheye_layout = QtWidgets.QVBoxLayout(self.fisheye_box)
-        fisheye_layout.setContentsMargins(0, 0, 0, 0)
-        fisheye_layout.setSpacing(8)
-        self.fisheye = QtWidgets.QCheckBox("Shot with a fisheye lens")
-        fisheye_row = QtWidgets.QHBoxLayout()
-        fisheye_row.addWidget(self.fisheye)
-        fisheye_row.addWidget(help_button(
-            "Manual lenses don't record their focal length in the photos, so enter it here "
-            "with the sensor width. The photos are used as they are, never stretched flat.",
-            "Spirula only. Fujifilm APS-C is 23.5 mm wide, Canon APS-C 22.3 mm.",
-        ))
-        fisheye_row.addStretch(1)
-        fisheye_layout.addLayout(fisheye_row)
-        lens_row = QtWidgets.QWidget()
-        lens_layout = QtWidgets.QHBoxLayout(lens_row)
-        lens_layout.setContentsMargins(0, 0, 0, 0)
-        lens_layout.setSpacing(8)
+        cameras_card, cameras_layout = card("Cameras")
+        self.cameras_form = FormGrid(cameras_layout)
+        self.lens = choice((("standard", "Standard lens"), ("fisheye", "Fisheye")))
+        self.cameras_form.add(
+            "lens", "Lens", inline(self.lens),
+            "Manual lenses don't record their focal length in the photos, so enter it for a "
+            "fisheye with the sensor width. The photos are used as they are, never stretched flat.",
+            "Fujifilm APS-C is 23.5 mm wide, Canon APS-C 22.3 mm.",
+        )
         self.fisheye_focal = QtWidgets.QDoubleSpinBox()
         self.fisheye_focal.setRange(1.0, 50.0)
         self.fisheye_focal.setDecimals(1)
@@ -1403,31 +1474,38 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sensor_width.setToolTip(
             "Fujifilm APS-C (X-T20 and most X bodies): 23.5 mm. Canon APS-C (M50): 22.3 mm."
         )
-        lens_layout.addWidget(self.fisheye_focal)
-        lens_layout.addWidget(self.sensor_width)
-        lens_layout.addStretch(1)
-        fisheye_layout.addWidget(lens_row)
-        # Shown only when the choice conflicts with the engine.
-        self.fisheye_help = label("", "notice")
-        self.fisheye_help.hide()
-        fisheye_layout.addWidget(self.fisheye_help)
-        source_layout.addWidget(self.fisheye_box)
-        self.source_preview = label("Choose an input to see its size and storage estimate.", "helper")
-        source_layout.addWidget(self.source_preview)
-        self.results_hint = label("", "helper")  # shown as the preview's tooltip
-        left.addWidget(source_card)
+        half = (CONTROL_WIDTH - 8) // 2
+        self.fisheye_focal.setFixedWidth(half)
+        self.sensor_width.setFixedWidth(half)
+        self.sensor_width.setSuffix(" mm sensor")
+        self.cameras_form.add("lens_size", "Focal length", inline(self.fisheye_focal, self.sensor_width),
+                              "The lens's focal length and the camera's sensor width.")
+        self.vignetting = QtWidgets.QCheckBox("Correct lens darkening at the edges")
+        self.cameras_form.wide(inline(self.vignetting, help_button(
+            "Many lenses darken the corners, strongly so for wide or fisheye lenses at wide "
+            "apertures. Then a wall looks darker in one photo's corner than in the next "
+            "photo's centre, and training can turn that into blotches or floaters.",
+            "On: Spirula's camera model (NVIDIA's PPISP) also learns the lens's corner "
+            "darkening and keeps it out of the splat. Turned on automatically when you pick "
+            "Fisheye.",
+        )))
+        self.matcher = choice((("sift", "Standard (SIFT)"), ("aliked", "Learned (ALIKED + LightGlue)"),
+                               ("loma", "LoMa")), MATCHER_HELP)
+        self.cameras_form.add(
+            "matcher", "Feature matching", inline(self.matcher),
+            "How the camera solver recognises the same spot in different frames. If parts of "
+            "a capture come out doubled, or a job stops because only part of the frames joined "
+            "up (identical rods, tiles, windows or shiny surfaces make look-alike spots), pick "
+            "a stronger option and run it again.",
+            *MATCHER_HELP.values(),
+        )
+        left.addWidget(cameras_card)
 
         quality_card, quality_layout = card("Training")
-        self.engine_hint = label("", "helper")
-        quality_layout.addWidget(self.engine_hint)
-
-        # Spirula options (the default engine).
-        self.spirula_box = QtWidgets.QWidget()
-        spirula_layout = QtWidgets.QVBoxLayout(self.spirula_box)
-        spirula_layout.setContentsMargins(0, 0, 0, 0)
-        spirula_layout.setSpacing(8)
-        spirula_layout.addWidget(titled(
-            "Quality",
+        training_form = FormGrid(quality_layout)
+        self.quality = choice(tuple((key, text) for key, (text, _steps, _splats) in QUALITY_LEVELS.items()))
+        training_form.add(
+            "quality", "Quality", inline(self.quality),
             "How much detail the splat can hold. Higher levels allow more splats and train "
             "longer; Spirula stops adding splats at the level's budget, so more steps alone "
             "can't add detail.",
@@ -1437,212 +1515,111 @@ class MainWindow(QtWidgets.QMainWindow):
             "streamed detail so phones stay smooth.",
             "Ultra: up to 10 million splats, 80,000 steps. Hero pieces only: needs a GPU "
             "with about 48 GB, trains several times longer and makes large files.",
-            "These steps suit up to 300 photos or frames. Each step learns from one image, so "
-            "bigger captures train longer to see every image about as often: 450 frames on "
-            "Standard trains 45,000 steps. The most is 2.5x the level's steps. Draft is never "
-            "raised, so it stays a quick check; use a low fps with it.",
-        ))
-        quality_row, self.quality_buttons = segment_row(
-            tuple((key, label) for key, (label, _steps, _splats) in QUALITY_LEVELS.items()), self,
         )
-        spirula_layout.addLayout(quality_row)
+        self.primitive = choice((("3dgs", "Standard (3DGS)"), ("3dgut", "Lens-accurate (3DGUT)")),
+                                PRIMITIVE_HELP)
+        training_form.add("primitive", "Splat type", inline(self.primitive), *PRIMITIVE_HELP.values())
+        self.splats = QtWidgets.QDoubleSpinBox()
+        self.splats.setRange(MIN_SPLATS / 1e6, MAX_SPLATS / 1e6)
+        self.splats.setDecimals(1)
+        self.splats.setSingleStep(0.5)
+        self.splats.setSuffix(" million")
+        self.splats.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons)
+        self.splats_mode = choice((("auto", "Auto"), ("custom", "Custom")))
+        training_form.add(
+            "splats", "Splat limit", inline(self.splats_mode, self.splats),
+            "Auto: the quality level's limit (High 3 million, Ultra 10 million).",
+            "Custom: training grows up to this many splats instead, e.g. 6 million for a large "
+            "multi-room capture. More splats hold more detail but need more GPU memory (about "
+            "2.5 GB per million at the peak), train slower and make bigger files.",
+        )
+        self.steps = QtWidgets.QSpinBox()
+        self.steps.setRange(10, 1_000_000)
+        self.steps.setGroupSeparatorShown(True)
+        self.steps.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons)
+        self.steps_mode = choice((("auto", "Auto"), ("custom", "Custom")))
+        training_form.add(
+            "steps", "Training steps", inline(self.steps_mode, self.steps),
+            "Auto: the quality level's steps. They suit up to 300 photos or frames; bigger "
+            "captures train longer so every image is seen about as often (450 frames on "
+            "Standard trains 45,000 steps), up to 2.5x the level's steps. Draft is never "
+            "raised, so it stays a quick check.",
+            "Custom: exactly this many steps.",
+        )
         self.quality_notice = label("", "notice")
         self.quality_notice.hide()
-        spirula_layout.addWidget(self.quality_notice)
-        spirula_layout.addSpacing(4)
-        spirula_layout.addWidget(titled("Splat type", *PRIMITIVE_HELP.values()))
-        primitive_row, self.primitive_buttons = segment_row(
-            (("3dgs", "Standard (3DGS)"), ("3dgut", "Lens-accurate (3DGUT)")), self,
-        )
-        spirula_layout.addLayout(primitive_row)
-        vignetting_row = QtWidgets.QHBoxLayout()
-        self.vignetting = QtWidgets.QCheckBox("Correct lens darkening at the edges")
-        vignetting_row.addWidget(self.vignetting)
-        vignetting_row.addWidget(help_button(
-            "Many lenses darken the corners, strongly so for wide or fisheye lenses at wide "
-            "apertures. Then a wall looks darker in one photo's corner than in the next "
-            "photo's centre, and training can turn that into blotches or floaters.",
-            "On: Spirula's camera model (NVIDIA's PPISP) also learns the lens's corner "
-            "darkening and keeps it out of the splat. Turned on automatically with the "
-            "fisheye option. Spirula leaves it off by default, so compare a run with and "
-            "without.",
-        ))
-        vignetting_row.addStretch(1)
-        spirula_layout.addLayout(vignetting_row)
-        scene_row = QtWidgets.QHBoxLayout()
-        self.main_scene = QtWidgets.QCheckBox("Keep to the main scene")
-        scene_row.addWidget(self.main_scene)
-        scene_row.addWidget(help_button(
-            "Training normally tries to explain everything in every photo, so sky and distant "
-            "buildings become big blurry splats far away. They also show behind and through "
-            "the main scene, so deleting them later leaves holes.",
-            "On: after the camera positions are solved, the pod works out the main scene (a "
-            "cylinder around what you circled, or a box around the bulk of the scene) and "
-            "trains only there. Far background is left out from the start: a compact splat "
-            "with a clean edge, shown over your background colour or a skybox. Off keeps the "
-            "surroundings.",
-        ))
-        scene_row.addStretch(1)
-        spirula_layout.addLayout(scene_row)
-        object_row = QtWidgets.QHBoxLayout()
-        self.object_scan = QtWidgets.QCheckBox("Object scan: cut away the background")
-        object_row.addWidget(self.object_scan)
-        object_row.addWidget(help_button(
-            "For one thing on a table, like a pastry, a shoe or a sculpture, photographed "
-            "in rings all the way round. An AI model (BiRefNet) finds the object in every "
-            "photo and masks out the table and the room, and Spirula trains with its object "
-            "preset. No cleanup afterwards, and every splat goes into the object.",
-            "The camera solver still uses the whole photos, so keep a patterned surface "
-            "under the object: it is what places the photos. Costs about 2–3 extra minutes "
-            "on the pod (a 424 MB model download, then masking each photo). If masking "
-            "fails, the job trains normally and says so in the log.",
-        ))
-        object_row.addStretch(1)
-        spirula_layout.addLayout(object_row)
-        turntable_row = QtWidgets.QHBoxLayout()
-        turntable_row.setContentsMargins(24, 0, 0, 0)
-        self.turntable = QtWidgets.QCheckBox("Turntable: the object was turned, not the camera")
-        turntable_row.addWidget(self.turntable)
-        turntable_row.addWidget(help_button(
-            "Tick this when the object was rotated (on a turntable, or by turning the plate or "
-            "paper under it) while the camera stayed put. The background is then masked out "
-            "before the camera positions are worked out, so the still background can't "
-            "confuse them. If masking fails, the job stops before training.",
-            "Keep the light soft and even: when the object turns and the lights don't, its "
-            "shadows and highlights move, which can make shiny parts soft or blotchy. Photos "
-            "from two or three camera heights give a full object; one height leaves the top "
-            "or underside weak.",
-        ))
-        turntable_row.addStretch(1)
-        spirula_layout.addLayout(turntable_row)
-        spirula_layout.addSpacing(4)
-        spirula_layout.addWidget(titled(
-            "Floater suppression",
+        training_form.wide(self.quality_notice)
+        left.addWidget(quality_card)
+
+        cleanup_card, cleanup_layout = card("Cleanup")
+        self.cleanup_form = FormGrid(cleanup_layout)
+        self.floaters = choice((("off", "Off"), ("mild", "Mild"), ("strong", "Strong")), FLOATER_HELP)
+        self.cleanup_form.add(
+            "floaters", "Floater suppression", inline(self.floaters),
             "Floaters are blurry blobs hanging in mid-air, usually in spots the camera only "
             "saw from a few angles.",
             *FLOATER_HELP.values(),
             REFLECTION_HELP,
-        ))
-        floater_row, self.floater_buttons = segment_row(
-            (("off", "Off"), ("mild", "Mild"), ("strong", "Strong")), self,
         )
-        spirula_layout.addLayout(floater_row)
-        spirula_layout.addSpacing(4)
-        spirula_layout.addWidget(titled(
-            "Ignore moving things",
+        self.one_surface = QtWidgets.QCheckBox("One surface per pixel")
+        self.cleanup_form.wide(inline(self.one_surface, help_button(
+            "Training may explain a wall or ceiling as several half-transparent layers, one "
+            "behind the other. From the photos' own viewpoints that looks right; from anywhere "
+            "else it shows as haze, floaters or a doubled copy.",
+            "On: training is pushed to put each pixel's colour on one surface (the setting "
+            "Spirula's own clean-geometry presets use). It needs no AI maps, so people and "
+            "other passers-by in the photos can't mislead it. Every AI geometry guidance level "
+            "already includes it. On thin, open structures it can fill small gaps.",
+        )))
+        self.distraction = choice((("off", "Off"), ("mild", "Mild"), ("strong", "Strong")), DISTRACTION_HELP)
+        self.cleanup_form.add(
+            "distraction", "Ignore moving things", inline(self.distraction),
             "People walking past, cars, or your own reflection sliding across a metal door "
             "or window. They are somewhere different in every frame, so training smears "
             "them into ghosts and haze.",
             *DISTRACTION_HELP.values(),
-        ))
-        distraction_row, self.distraction_buttons = segment_row(
-            (("off", "Off"), ("mild", "Mild"), ("strong", "Strong")), self,
         )
-        spirula_layout.addLayout(distraction_row)
-        spirula_layout.addSpacing(4)
-        spirula_layout.addWidget(titled(
-            "AI geometry guidance",
+        self.people_masks = QtWidgets.QCheckBox("Mask people")
+        self.cleanup_form.wide(inline(self.people_masks, help_button(
+            "After the cameras are solved, a person detector finds the people in every photo "
+            "and training leaves those pixels out, so passers-by can't turn into ghosts or "
+            "floaters. It matters most with depth guidance: depth maps draw every passer-by "
+            "as something solid standing there.",
+            "Painted or printed people that never reach below eye level, like figures on a "
+            "ceiling mural, are left alone. Adds about 2–4 minutes. A sheet of masked photos "
+            "comes back with the splat (people_masks.jpg) so you can check it.",
+            "Shadows and reflections of people are not masked; Ignore moving things handles "
+            "those, so keep both on. Not used for object scans, whose masks already keep only "
+            "the subject.",
+        )))
+        guidance_options = (("off", "Off"), ("surfaces", "Surfaces"), ("depth", "Surfaces + depth"),
+                            *((key, extra[0]) for key, extra in EXTRA_GUIDANCE.items()))
+        self.guidance = choice(guidance_options, GUIDANCE_HELP)
+        self.cleanup_form.add(
+            "guidance", "AI geometry guidance", inline(self.guidance),
             "Before training, an AI model looks at each frame and guesses which way every "
             "surface faces. Training uses those guesses as hints, so walls, floors and tables "
             "come out flat and solid instead of lumpy or hollow.",
             *GUIDANCE_HELP.values(),
-            "Every level except Off also adds a mild \"one surface per pixel\" push (the value "
-            "Spirula's own clean-geometry presets use), so a little of Floater suppression's "
-            "effect remains even with that set to Off. On thin, open structures it can fill "
-            "small gaps.",
-        ))
-        guidance_row, self.guidance_buttons = segment_row(
-            (("off", "Off"), ("surfaces", "Surfaces"), ("depth", "Surfaces + depth"),
-             *((key, extra[0]) for key, extra in EXTRA_GUIDANCE.items())), self,
+            "Every level except Off also includes \"one surface per pixel\". On thin, open "
+            "structures guidance can glue parts together, and AI maps can be misled by people "
+            "in the photos.",
         )
-        spirula_layout.addLayout(guidance_row)
-        spirula_layout.addSpacing(4)
-        spirula_layout.addWidget(titled(
-            "Feature matching",
-            "How the camera solver recognises the same spot in different frames. If a job stops "
-            "because only part of the frames joined up (identical rods, tiles, windows or "
-            "shiny surfaces make look-alike spots), pick a stronger option and run it again.",
-            "Standard (SIFT): the classic method. Fast, nothing to download. Fine for most "
-            "rooms, objects and outdoor scenes.",
-            "Learned (ALIKED + LightGlue): AI features and matching, widely used since 2023. "
-            "Much better at repetitive or shiny subjects. Camera solving takes roughly 10–15 "
-            "minutes longer.",
-            "LoMa: the newest matcher (2026), built for the hardest pairs. Its features take in "
-            "a wider view around each spot, which helps tell repeated shapes apart. Downloads "
-            "about 1.4 GB on each pod and solves slowest. Promising, but not yet widely "
-            "compared.",
-        ))
-        matcher_row, self.matcher_buttons = segment_row(
-            (("sift", "Standard"), ("aliked", "Learned"), ("loma", "LoMa")), self,
-        )
-        spirula_layout.addLayout(matcher_row)
-        quality_layout.addWidget(self.spirula_box)
-
-        self.quality_summary = label("", "helper")  # the summary bar shows the same
-        self.advanced_button = QtWidgets.QToolButton()
-        self.advanced_button.setObjectName("expander")
-        self.advanced_button.setText("Advanced")
-        self.advanced_button.setCheckable(True)
-        self.advanced_button.setIcon(icon("chevron_right", theme.PRIMARY, 18))
-        self.advanced_button.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
-        self.advanced_button.setCursor(QtCore.Qt.PointingHandCursor)
-        self.advanced_button.toggled.connect(self._toggle_advanced)
-        quality_layout.addWidget(self.advanced_button, alignment=QtCore.Qt.AlignLeft)
-        self.advanced_widget = QtWidgets.QWidget()
-        advanced_layout = QtWidgets.QVBoxLayout(self.advanced_widget)
-        advanced_layout.setContentsMargins(0, 0, 0, 0)
-        advanced_layout.setSpacing(8)
-        advanced_layout.addWidget(titled(
-            "Engine",
-            "Spirula Studio finds the cameras and trains on the pod with its own tools. "
-            "Nerfstudio uses COLMAP and Splatfacto, which is slower and doesn't have "
-            "Spirula's options.",
-        ))
-        engine_row, self.engine_buttons = segment_row(
-            (("spirula", "Spirula Studio (recommended)"), ("nerfstudio", "Nerfstudio")), self,
-        )
-        advanced_layout.addLayout(engine_row)
-        advanced_form = QtWidgets.QFormLayout()
-        advanced_form.setContentsMargins(0, 6, 0, 0)
-        advanced_form.setSpacing(10)
-        self.steps = QtWidgets.QSpinBox()
-        self.steps.setRange(10, 1_000_000)
-        self.steps.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons)
-        self.downscales = QtWidgets.QSpinBox()
-        self.downscales.setRange(0, 8)
-        self.downscales.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons)
         self.depth_weight = QtWidgets.QDoubleSpinBox()
         self.depth_weight.setRange(0.0, 1.0)
         self.depth_weight.setDecimals(2)
         self.depth_weight.setSingleStep(0.01)
         self.depth_weight.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons)
-        self.depth_weight.setToolTip(
-            "How strongly the AI's distance guesses steer training (Spirula, guidance levels "
-            "with depth). Training balances matching the photos against matching the depth's "
-            "shape; this is the weight of the second. 0.05 is a gentle nudge, about 0.2 gives "
-            "depth a real say where the photos are ambiguous, and 0.5 or more lets it "
-            "overrule them, mistakes included."
+        self.depth_weight.setFixedWidth((CONTROL_WIDTH - 8) // 2)
+        self.cleanup_form.add(
+            "depth_weight", "Depth strength", inline(self.depth_weight),
+            "How strongly the AI's distance guesses steer training. Training balances matching "
+            "the photos against matching the depth's shape; this is the weight of the second. "
+            "0.05 is a gentle nudge; 0.3 (the default) gives depth a real say where the photos "
+            "are ambiguous, like plain walls and shiny floors; 0.5 or more lets it overrule "
+            "them, mistakes included. Use less, or no depth, for thin open structures.",
         )
-        self.steps_override = QtWidgets.QCheckBox("Set by hand")
-        self.steps_override.setToolTip(
-            "Off: Spirula trains for its quality level's steps, raised for captures of more "
-            "than 300 images (up to 2.5x) so every image is seen about as often. "
-            "Nerfstudio always uses this number."
-        )
-        steps_row = QtWidgets.QWidget()
-        steps_layout = QtWidgets.QHBoxLayout(steps_row)
-        steps_layout.setContentsMargins(0, 0, 0, 0)
-        steps_layout.setSpacing(10)
-        steps_layout.addWidget(self.steps, 1)
-        steps_layout.addWidget(self.steps_override)
-        advanced_form.addRow("Training steps", steps_row)
-        advanced_form.addRow("Image downscales", self.downscales)
-        advanced_form.addRow("Depth guidance strength", self.depth_weight)
-        self.downscales.setToolTip("Used by Nerfstudio preprocessing only.")
-        advanced_layout.addLayout(advanced_form)
-        self.advanced_widget.hide()
-        quality_layout.addWidget(self.advanced_widget)
-        left.addWidget(quality_card)
+        left.addWidget(cleanup_card)
         left.addStretch(1)
         left_widget = QtWidgets.QWidget()
         left_widget.setLayout(left)
@@ -1702,11 +1679,32 @@ class MainWindow(QtWidgets.QMainWindow):
         self.gpu_list.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
         self.gpu_list.currentItemChanged.connect(self._update_run_enabled)
         details.addWidget(self.gpu_list, 1)
+        wait_row = QtWidgets.QHBoxLayout()
+        self.wait_for_gpu = QtWidgets.QCheckBox("Wait for my pick if it's taken")
+        wait_row.addWidget(self.wait_for_gpu)
+        wait_row.addWidget(help_button(
+            "On: you can also pick a GPU that has no free card right now (greyed out). The job "
+            "then waits in the jobs list and starts as soon as one is free, or when you press "
+            "Stop. A waiting job holds one pod slot but costs nothing until its pod exists.",
+            "It checks RunPod about once a minute (all waiting jobs together at most every 20 "
+            "seconds) and slows down by itself if RunPod asks it to. The price and VRAM limits "
+            "above still apply.",
+        ))
+        wait_row.addStretch(1)
+        details.addLayout(wait_row)
         self.gpu_details.hide()
         gpu_layout.addWidget(self.gpu_details, 1)
         gpu_layout.addStretch(0)
         right = QtWidgets.QVBoxLayout()
+        right.setSpacing(16)
         right.addWidget(gpu_card)
+        job_card, job_layout = card("This job")
+        self.job_rows = QtWidgets.QLabel("Choose a capture to see the job.")
+        self.job_rows.setObjectName("jobRows")
+        self.job_rows.setWordWrap(True)
+        self.job_rows.setTextFormat(QtCore.Qt.RichText)
+        job_layout.addWidget(self.job_rows)
+        right.addWidget(job_card)
         right.addStretch(1)
         right_widget = QtWidgets.QWidget()
         right_widget.setLayout(right)
@@ -1797,25 +1795,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.manager.untracked_check_failed.connect(
             lambda message: self.totals.setToolTip(message)
         )
-        for button in (*self.engine_buttons.values(), *self.floater_buttons.values(),
-                       *self.distraction_buttons.values(), *self.matcher_buttons.values(),
-                       *self.guidance_buttons.values(), *self.primitive_buttons.values(),
-                       *self.quality_buttons.values()):
-            button.clicked.connect(self._engine_changed)
-        self.fisheye.toggled.connect(self._fisheye_changed)
-        self.steps_override.toggled.connect(self._update_quality_summary)
+        for box in (self.floaters, self.distraction, self.matcher, self.guidance,
+                    self.primitive, self.quality, self.subject, self.steps_mode, self.splats_mode):
+            box.currentIndexChanged.connect(self._engine_changed)
+        self.lens.currentIndexChanged.connect(self._fisheye_changed)
+        self.wait_for_gpu.toggled.connect(self._wait_for_gpu_changed)
         self.vignetting.toggled.connect(self._update_quality_summary)
-        self.object_scan.toggled.connect(self._update_quality_summary)
-        self.main_scene.toggled.connect(self._update_quality_summary)
-        self.object_scan.toggled.connect(self.turntable.setEnabled)
-        self.turntable.toggled.connect(self._update_quality_summary)
-        # Fisheye lenses vignette strongly: switching fisheye on turns this on too.
-        self.fisheye.clicked.connect(lambda on: on and self.vignetting.setChecked(True))
+        self.one_surface.toggled.connect(self._update_quality_summary)
+        self.people_masks.toggled.connect(self._update_quality_summary)
+        # Fisheye lenses vignette strongly: picking Fisheye turns the correction on too.
+        self.lens.activated.connect(lambda _: self._fisheye() and self.vignetting.setChecked(True))
         self.fisheye_focal.valueChanged.connect(self._update_quality_summary)
         self.sensor_width.valueChanged.connect(self._update_quality_summary)
         self.depth_weight.valueChanged.connect(self._update_quality_summary)
-        for button in (self.local_mode, self.drive_mode):
-            button.clicked.connect(self._input_kind_changed)
+        self.source_kind.currentIndexChanged.connect(self._input_kind_changed)
         self.drive_listing_ready.connect(self._drive_listing_ready)
         self.drive_videos_probed.connect(self._drive_videos_probed)
         self.input_folder.editingFinished.connect(self._local_folder_changed)
@@ -1826,8 +1819,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.vram.valueChanged.connect(self._update_quality_summary)
         self.max_vram.valueChanged.connect(self._invalidate_gpus)
         self.max_vram.valueChanged.connect(self._update_quality_summary)
-        self.downscales.valueChanged.connect(self._source_settings_changed)
         self.steps.valueChanged.connect(self._update_quality_summary)
+        self.splats.valueChanged.connect(self._update_quality_summary)
 
     # ------------------------------------------------------------------
     # Settings
@@ -1840,98 +1833,145 @@ class MainWindow(QtWidgets.QMainWindow):
         self.vram.setValue(self.config.min_gpu_vram_gb)
         self.max_vram.setValue(self.config.max_gpu_vram_gb)
         self.steps.setValue(self.config.pipeline_max_steps)
-        self.downscales.setValue(self.config.pipeline_num_downscales)
-        self.drive_mode.setChecked(self.config.input_kind == "drive")
-        self.local_mode.setChecked(not self.drive_mode.isChecked())
+        choose(self.source_kind, "drive" if self.config.input_kind == "drive" else "local")
         self.results_folder.setText(self.config.results_folder)
         self._update_drive_selection_text()
-        self.engine_buttons[self.config.engine].setChecked(True)
-        self.floater_buttons[self.config.spirula_floaters].setChecked(True)
-        self.distraction_buttons[self.config.spirula_distraction].setChecked(True)
-        self.guidance_buttons[self.config.spirula_guidance].setChecked(True)
-        self.matcher_buttons[self.config.spirula_matcher].setChecked(True)
+        # The page is Spirula-only now; a saved Nerfstudio choice falls back to it.
+        self.config.engine = "spirula"
+        choose(self.floaters, self.config.spirula_floaters)
+        choose(self.distraction, self.config.spirula_distraction)
+        choose(self.guidance, self.config.spirula_guidance)
+        choose(self.matcher, self.config.spirula_matcher)
         self.depth_weight.setValue(self.config.spirula_depth_weight)
-        self.primitive_buttons[self.config.spirula_primitive].setChecked(True)
-        self.quality_buttons[self.config.spirula_quality].setChecked(True)
+        choose(self.primitive, self.config.spirula_primitive)
+        choose(self.quality, self.config.spirula_quality)
         self.vignetting.setChecked(bool(self.config.spirula_vignetting))
-        self.object_scan.setChecked(bool(self.config.spirula_object))
-        self.main_scene.setChecked(bool(self.config.spirula_main_scene))
-        self.turntable.setChecked(bool(self.config.spirula_turntable))
-        self.turntable.setEnabled(self.object_scan.isChecked())
-        self.steps_override.setChecked(bool(self.config.steps_override))
-        self.fisheye.setChecked(bool(self.config.fisheye_lens))
+        self.one_surface.setChecked(bool(self.config.spirula_one_surface))
+        self.people_masks.setChecked(bool(self.config.spirula_people_masks))
+        choose(self.subject, "turntable" if self.config.spirula_object and self.config.spirula_turntable
+               else "object" if self.config.spirula_object
+               else "main" if self.config.spirula_main_scene else "scene")
+        choose(self.steps_mode, "custom" if self.config.steps_override else "auto")
+        self.wait_for_gpu.setChecked(bool(self.config.wait_for_gpu))
+        self.splats.setValue(self.config.spirula_max_splats / 1e6)
+        choose(self.splats_mode, "custom" if self.config.splats_override else "auto")
+        choose(self.lens, "fisheye" if self.config.fisheye_lens else "standard")
         self.fisheye_focal.setValue(self.config.fisheye_focal_mm)
         self.sensor_width.setValue(self.config.sensor_width_mm)
+        self._input_kind_changed()
         self._fisheye_changed()
+        self._engine_changed()
+
+    def _fisheye(self) -> bool:
+        return chosen(self.lens, "standard") == "fisheye"
+
+    def _drive(self) -> bool:
+        return chosen(self.source_kind, "local") == "drive"
+
+    def _subject(self) -> str:
+        return chosen(self.subject, "scene")
+
+    def _steps_custom(self) -> bool:
+        return chosen(self.steps_mode, "auto") == "custom"
+
+    def _splats_custom(self) -> bool:
+        return chosen(self.splats_mode, "auto") == "custom"
 
     def _fisheye_changed(self, *_):
-        on = self.fisheye.isChecked()
-        self.fisheye_focal.setEnabled(on)
-        self.sensor_width.setEnabled(on)
+        self.cameras_form.show("lens_size", self._fisheye())
         self._update_quality_summary()
 
     def _quality(self) -> str:
-        return checked_key(self.quality_buttons, "medium")
+        return chosen(self.quality, "medium")
 
     def _effective_steps(self, plan: InputPlan | None = None) -> int:
         """Steps the job will train for (the pod confirms them from the real image count)."""
-        if self._engine() == "spirula" and not self.steps_override.isChecked():
+        if self._engine() == "spirula" and not self._steps_custom():
             plan = plan or self._shown_plan
             return quality_steps(self._quality(), plan.image_count if plan else None)
         return self.steps.value()
+
+    def _splat_budget(self) -> int:
+        """Most splats training may grow: the quality level's, or the one set by hand."""
+        if self._splats_custom():
+            return round(self.splats.value() * 10) * 100_000
+        return QUALITY_LEVELS[self._quality()][2]
 
     def _steps_text(self, plan: InputPlan | None = None) -> str:
         """'45,000 steps (raised for 450 frames)', or just the steps."""
         steps = self._effective_steps(plan)
         plan = plan or self._shown_plan
         base = QUALITY_LEVELS[self._quality()][1]
-        if self._engine() != "spirula" or self.steps_override.isChecked() or steps == base:
+        if self._engine() != "spirula" or self._steps_custom() or steps == base:
             return f"{steps:,} steps"
         noun = ("frames" if plan and plan.is_video else "photos and frames" if plan and plan.is_mixed
                 else "photos")
         return f"{steps:,} steps (raised for {plan.image_count:,} {noun})"
 
     def _primitive(self) -> str:
-        return checked_key(self.primitive_buttons, "3dgs")
+        return chosen(self.primitive, "3dgs")
 
     def _floaters(self) -> str:
-        return checked_key(self.floater_buttons, "off")
+        return chosen(self.floaters, "off")
 
     def _guidance(self) -> str:
-        return checked_key(self.guidance_buttons, "off")
+        return chosen(self.guidance, "off")
 
     def _matcher(self) -> str:
-        return checked_key(self.matcher_buttons, "sift")
+        return chosen(self.matcher, "sift")
 
     def _distraction(self) -> str:
-        return checked_key(self.distraction_buttons, "off")
+        return chosen(self.distraction, "off")
 
     def _spirula_options_text(self) -> str:
         """Short description of the Spirula cleanup options, for summaries."""
+        splats = (f" · {self._splat_budget() / 1e6:g}M splats"
+                  if self._splats_custom() else "")
         text = (
-            f"{QUALITY_LEVELS[self._quality()][0]} · {self._primitive()} · "
+            f"{QUALITY_LEVELS[self._quality()][0]}{splats} · {self._primitive()} · "
             f"floaters: {self._floaters()} · guidance: {GUIDANCE_LABELS[self._guidance()]}"
         )
-        if self.fisheye.isChecked():
+        if self._fisheye():
             text = f"fisheye {self.fisheye_focal.value():g} mm · " + text
         if self._guidance() in DEPTH_GUIDANCE:
             text += f" ({self.depth_weight.value():g})"
         if self._distraction() != "off":
             text += f" · ignore moving: {self._distraction()}"
+        if self._one_surface_extra():
+            text += " · one surface per pixel"
+        if self._people_masks_on():
+            text += " · people masked"
         if self.vignetting.isChecked():
             text += " · vignetting corrected"
-        if self.main_scene.isChecked():
+        if self._subject() == "main":
             text += " · main scene only"
         if self._matcher() != "sift":
             text += f" · matching: {self._matcher()}"
-        if self.object_scan.isChecked():
-            text = ("turntable object scan · " if self.turntable.isChecked() else "object scan · ") + text
+        if self._subject() in ("object", "turntable"):
+            text = ("turntable object scan · " if self._subject() == "turntable" else "object scan · ") + text
         return text
 
     def _engine(self) -> str:
-        return "spirula" if self.engine_buttons["spirula"].isChecked() else "nerfstudio"
+        return "spirula"
+
+    def _one_surface_extra(self) -> bool:
+        """The one-surface switch on its own; guidance levels already include it."""
+        return self.one_surface.isChecked() and self._guidance() == "off"
+
+    def _people_masks_on(self) -> bool:
+        """Object scans have their own subject masks, so people masking sits out."""
+        return self.people_masks.isChecked() and self._subject() not in ("object", "turntable")
 
     def _engine_changed(self, *_):
+        # with guidance on, "one surface per pixel" is already part of it
+        guided = self._guidance() != "off"
+        self.one_surface.setEnabled(not guided)
+        self.one_surface.setText("One surface per pixel (included in guidance)" if guided
+                                 else "One surface per pixel")
+        object_scan = self._subject() in ("object", "turntable")
+        self.people_masks.setEnabled(not object_scan)
+        self.people_masks.setText("Mask people (not used for object scans)" if object_scan
+                                  else "Mask people")
         self._update_quality_summary()
 
     def _save_settings(self):
@@ -1943,12 +1983,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.config.spirula_primitive = self._primitive()
         self.config.spirula_quality = self._quality()
         self.config.spirula_vignetting = self.vignetting.isChecked()
-        self.config.spirula_object = self.object_scan.isChecked()
-        self.config.spirula_main_scene = self.main_scene.isChecked()
+        self.config.spirula_one_surface = self.one_surface.isChecked()
+        self.config.spirula_people_masks = self.people_masks.isChecked()
+        self.config.spirula_object = self._subject() in ("object", "turntable")
+        self.config.spirula_main_scene = self._subject() == "main"
         self.config.spirula_matcher = self._matcher()
-        self.config.spirula_turntable = self.turntable.isChecked()
-        self.config.steps_override = self.steps_override.isChecked()
-        self.config.fisheye_lens = self.fisheye.isChecked()
+        self.config.spirula_turntable = self._subject() == "turntable"
+        self.config.steps_override = self._steps_custom()
+        self.config.wait_for_gpu = self.wait_for_gpu.isChecked()
+        self.config.splats_override = self._splats_custom()
+        if self._splats_custom():
+            self.config.spirula_max_splats = self._splat_budget()
+        self.config.fisheye_lens = self._fisheye()
         self.config.fisheye_focal_mm = self.fisheye_focal.value()
         self.config.sensor_width_mm = self.sensor_width.value()
         # input_folder and the ticks are saved as they change (_local_folder_changed).
@@ -1959,7 +2005,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.config.min_gpu_vram_gb = self.vram.value()
         self.config.max_gpu_vram_gb = self.max_vram.value()
         self.config.pipeline_max_steps = self.steps.value()
-        self.config.pipeline_num_downscales = self.downscales.value()
         self.config.save_state()
 
     def _open_settings(self):
@@ -2043,6 +2088,27 @@ class MainWindow(QtWidgets.QMainWindow):
         except (OSError, ValueError):
             return folder, [], []
 
+    @staticmethod
+    def _group_key(group: str) -> str:
+        """Checklist key of a photo sub-folder ("" is the folder's own photos)."""
+        return f"{PHOTOS_ITEM}/{group}" if group else PHOTOS_ITEM
+
+    @staticmethod
+    def _group_row(group: str, count: int, size: int) -> str:
+        photos = f"{count} photo{'s' if count != 1 else ''}  ·  {size_text(size)}"
+        return f"{group}/  ·  {photos}  ·  own lens fit" if group else photos
+
+    def _photo_folders(self, groups) -> tuple[str, ...]:
+        """The ticked photo groups for the job; () when that is just the folder's own photos."""
+        ticked = tuple(group for group in groups if self._ticked(self._group_key(group)))
+        return () if ticked == ("",) else ticked
+
+    def _local_subfolders(self, folder: Path | None) -> list[tuple[str, list[Path]]]:
+        try:
+            return photo_subfolders(folder) if folder is not None else []
+        except OSError:
+            return []
+
     def _local_video_info(self, video: Path) -> VideoInfo | None:
         """Length and size of a local video for its checklist row (cached; None if unreadable)."""
         try:
@@ -2058,7 +2124,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return self._local_video_infos[key]
 
     def _unticked(self) -> list:
-        return self.config.drive_unticked if self.drive_mode.isChecked() else self.config.local_unticked
+        return self.config.drive_unticked if self._drive() else self.config.local_unticked
 
     def _ticked(self, key: str) -> bool:
         return key not in self._unticked()
@@ -2066,24 +2132,26 @@ class MainWindow(QtWidgets.QMainWindow):
     def _refresh_capture_items(self):
         """List the chosen folder's photos (one row) and videos, ticked unless left out."""
         rows: list[tuple[str, str]] = []
-        if self.drive_mode.isChecked():
+        if self._drive():
             listing = self._drive_listing
             if listing is not None:
-                if listing.files:
-                    count = len(listing.files)
-                    rows.append((PHOTOS_ITEM, f"{count} photo{'s' if count != 1 else ''}  ·  "
-                                              f"{size_text(listing.total_bytes)}"))
+                groups: dict[str, list] = {}
+                for item in listing.files:
+                    groups.setdefault(item.group, []).append(item)
+                for group, items in groups.items():
+                    rows.append((self._group_key(group), self._group_row(
+                        group, len(items), sum(item.size for item in items))))
                 for video in listing.videos:
                     video = self._probed_videos.get(self._video_key(video), video)
                     rows.append((video.id, video_row(
                         video.name, video.size, video.duration_ms / 1000, video.width, video.height,
                     )))
         else:
-            _folder, photos, videos = self._local_contents()
-            if photos:
-                size = sum(photo.stat().st_size for photo in photos)
-                rows.append((PHOTOS_ITEM, f"{len(photos)} photo{'s' if len(photos) != 1 else ''}"
-                                          f"  ·  {size_text(size)}"))
+            folder, photos, videos = self._local_contents()
+            groups = ([("", photos)] if photos else []) + self._local_subfolders(folder)
+            for group, items in groups:
+                rows.append((self._group_key(group), self._group_row(
+                    group, len(items), sum(photo.stat().st_size for photo in items))))
             for video in videos:
                 info = self._local_video_info(video)
                 rows.append((video.name, video_row(
@@ -2111,7 +2179,7 @@ class MainWindow(QtWidgets.QMainWindow):
             for item in (self.capture_items.item(row) for row in range(self.capture_items.count()))
             if item.checkState() != QtCore.Qt.Checked
         ]
-        if self.drive_mode.isChecked():
+        if self._drive():
             self.config.drive_unticked = unticked
         else:
             self.config.local_unticked = unticked
@@ -2216,7 +2284,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _restore_drive_selection(self):
         """Re-read the saved Drive folder in the background so the plan is ready."""
-        if not self.drive_mode.isChecked() or not self.config.drive_folder_id:
+        if not self._drive() or not self.config.drive_folder_id:
             return
         path = self.config.drive_credentials_path()
         if path is None:
@@ -2245,7 +2313,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _source_kind(self) -> str:
         """Where the capture comes from: "local" or "drive"."""
-        return "drive" if self.drive_mode.isChecked() else "local"
+        return "drive" if self._drive() else "local"
 
     def _video_fps(self) -> float:
         """Frames per second to take from the videos."""
@@ -2258,15 +2326,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _source_plan(self) -> InputPlan:
         """Plan the ticked items: photos, videos, or both."""
-        fps, downscales, minimum = self._video_fps(), self.downscales.value(), self.config.volume_gb
-        if self.drive_mode.isChecked():
+        fps, downscales, minimum = self._video_fps(), self.config.pipeline_num_downscales, self.config.volume_gb
+        if self._drive():
             listing = self._drive_listing
             if listing is None:
                 raise ValueError(
                     "Loading the saved Google Drive folder..." if self.config.drive_folder_id
                     else "Choose a Google Drive folder."
                 )
-            photos = listing.files if self._ticked(PHOTOS_ITEM) else ()
+            photos = tuple(item for item in listing.files
+                           if self._ticked(self._group_key(item.group)))
             videos = self._drive_ticked_videos()
             root = self._results_root()
             if photos and videos:
@@ -2284,7 +2353,10 @@ class MainWindow(QtWidgets.QMainWindow):
             raise ValueError("Choose a folder with photos and/or videos.")
         if not folder.is_dir():
             raise ValueError("Select an existing folder.")
-        ticked_photos = photos if self._ticked(PHOTOS_ITEM) else []
+        groups = ([("", photos)] if photos else []) + self._local_subfolders(folder)
+        ticked_photos = [photo for group, items in groups
+                         if self._ticked(self._group_key(group)) for photo in items]
+        photo_folders = self._photo_folders([group for group, _ in groups])
         ticked_videos = [video for video in videos if self._ticked(video.name)]
         if ticked_photos and ticked_videos:
             return plan_mixed(folder, tuple(ticked_photos), tuple(ticked_videos), minimum,
@@ -2293,14 +2365,15 @@ class MainWindow(QtWidgets.QMainWindow):
             return plan_input(ticked_videos[0], "video", minimum, downscales, fps,
                               tuple(ticked_videos[1:]))
         if ticked_photos:
-            return plan_input(folder, "images", minimum, downscales, fps)
-        raise ValueError(self._nothing_ticked(bool(photos or videos)))
+            return plan_input(folder, "images", minimum, downscales, fps,
+                              photo_folders=photo_folders)
+        raise ValueError(self._nothing_ticked(bool(groups or videos)))
 
     def _gpu_signature(self, plan: InputPlan):
         common = (
             self.config.runpod_api_key, self.price.value(), self.vram.value(),
             self.max_vram.value(),
-            plan.kind, plan.volume_gb, plan.frame_target, self.downscales.value(),
+            plan.kind, plan.volume_gb, plan.frame_target, self.config.pipeline_num_downscales,
         )
         if plan.is_drive:
             return common + (
@@ -2315,8 +2388,9 @@ class MainWindow(QtWidgets.QMainWindow):
         return common + (str(plan.source), files)
 
     def _input_kind_changed(self, *_):
-        drive = self.drive_mode.isChecked()
+        drive = self._drive()
         self.source_pages.setCurrentIndex(1 if drive else 0)
+        self.source_form.show("results", drive)
         self.source_pages.setFixedHeight(self.source_pages.currentWidget().sizeHint().height())
         self.source_preview.setToolTip(
             "Results go in your results folder / Drive folder name / run time." if drive else
@@ -2337,21 +2411,27 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._shown_plan is not None and self._shown_plan.has_videos:
             self._update_source_preview()
 
-    def _toggle_advanced(self, expanded: bool):
-        self.advanced_widget.setVisible(expanded)
-        self.advanced_button.setIcon(
-            icon("chevron_down" if expanded else "chevron_right", theme.PRIMARY, 18)
-        )
-
     def _update_quality_summary(self, *_):
-        engine = self._engine()
-        self.downscales.setEnabled(engine == "nerfstudio")
-        self.spirula_box.setVisible(engine == "spirula")
-        self.steps.setEnabled(engine != "spirula" or self.steps_override.isChecked())
-        if engine == "spirula" and not self.steps_override.isChecked():
+        # Auto shows the quality level's number in the dropdown; Custom shows the field.
+        steps_custom, splats_custom = self._steps_custom(), self._splats_custom()
+        if not steps_custom:
             self.steps.blockSignals(True)
             self.steps.setValue(self._effective_steps())
             self.steps.blockSignals(False)
+        if not splats_custom:
+            self.splats.blockSignals(True)
+            self.splats.setValue(QUALITY_LEVELS[self._quality()][2] / 1e6)
+            self.splats.blockSignals(False)
+        self.steps_mode.setItemText(0, f"Auto · {self._effective_steps():,}" if not steps_custom else "Auto")
+        self.splats_mode.setItemText(
+            0, f"Auto · {QUALITY_LEVELS[self._quality()][2] / 1e6:g} million" if not splats_custom else "Auto")
+        # Custom: the dropdown makes room for the number beside it, in the same width
+        half = (CONTROL_WIDTH - 8) // 2
+        for mode, number, custom in ((self.steps_mode, self.steps, steps_custom),
+                                     (self.splats_mode, self.splats, splats_custom)):
+            mode.setFixedWidth(half if custom else CONTROL_WIDTH)
+            number.setFixedWidth(half)
+            number.setVisible(custom)
         capped = 0 < self.max_vram.value() < 40
         ultra_short = self._quality() == "ultra" and (self.vram.value() < 40 or capped)
         self.quality_notice.setText(
@@ -2359,26 +2439,8 @@ class MainWindow(QtWidgets.QMainWindow):
             + ("Raise or clear Maximum VRAM" if capped else "Raise Minimum VRAM")
             + " under GPU > Change."
         )
-        self.quality_notice.setVisible(engine == "spirula" and ultra_short)
-        conflict = self.fisheye.isChecked() and engine != "spirula"
-        self.fisheye_help.setText(
-            "Fisheye photos need Spirula Studio. Switch the engine under Training > Advanced."
-        )
-        self.fisheye_help.setVisible(conflict)
-        self.depth_weight.setEnabled(engine == "spirula"
-                                     and self._guidance() in DEPTH_GUIDANCE)
-        # Only worth a line when it isn't the default.
-        self.engine_hint.setVisible(engine != "spirula")
-        if engine == "spirula":
-            self.quality_summary.setText(
-                f"{self._steps_text()} · {self._spirula_options_text()}"
-            )
-        else:
-            self.engine_hint.setText("Using Nerfstudio. Switch back under Advanced.")
-            self.quality_summary.setText(
-                f"{self.steps.value():,} training steps · "
-                f"{'Original images only' if self.downscales.value() == 0 else 'Downscaled copies available'}"
-            )
+        self.quality_notice.setVisible(ultra_short)
+        self.cleanup_form.show("depth_weight", self._guidance() in DEPTH_GUIDANCE)
         self._refresh_gpu_estimates()
         self._update_summary()
 
@@ -2458,7 +2520,18 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _selected_gpu(self):
         item = self.gpu_list.currentItem()
-        return item.data(QtCore.Qt.UserRole) if item else None
+        if item is None or not item.flags() & QtCore.Qt.ItemIsEnabled:
+            return None
+        return item.data(QtCore.Qt.UserRole)
+
+    def _selected_gpu_free(self) -> bool:
+        """False when the picked GPU has no free card, so the job will wait for one."""
+        item = self.gpu_list.currentItem()
+        return bool(item and item.data(QtCore.Qt.UserRole + 3))
+
+    def _wait_for_gpu_changed(self, *_):
+        if self._gpu_candidates:
+            self._show_gpus(self._gpu_candidates, keep_selection=True)
 
     def _source_description(self, plan: InputPlan) -> str:
         parts = [f"{plan.photo_count} photos"] if plan.has_photos else []
@@ -2467,23 +2540,62 @@ class MainWindow(QtWidgets.QMainWindow):
             parts.append(f"{plan.extract_fps:g} fps from {noun} (≈ {plan.frame_target:,} frames)")
         return " + ".join(parts) + (" from Drive" if plan.is_drive else "")
 
+    def _settings_rows(self, plan: InputPlan) -> list[tuple[str, str]]:
+        """The job's settings as (name, value) rows, one per card on the page: the start
+        dialog and the This job card."""
+        rows = []
+        if plan.has_videos:
+            known = plan.video_info.duration_seconds > 0
+            rows.append(("Frames", f"{plan.extract_fps:g} per second of video"
+                         + (f"  ·  about {plan.frame_target:,}" if known else "")))
+        subject = self._subject()
+        rows.append(("Subject", SUBJECTS[subject][0]
+                     + ("  ·  about 2–3 min extra" if subject in ("object", "turntable") else "")))
+        lens = f"fisheye {self.fisheye_focal.value():g} mm" if self._fisheye() else "standard lens"
+        matching = {"sift": "Standard matching",
+                    "aliked": "Learned matching (about 10–15 min more solving)",
+                    "loma": "LoMa matching (1.4 GB download, slowest solving)"}[self._matcher()]
+        rows.append(("Cameras", f"{lens}  ·  {matching}"
+                     + ("  ·  vignetting corrected" if self.vignetting.isChecked() else "")))
+        splat = {"3dgs": "3DGS", "3dgut": "3DGUT"}[self._primitive()]
+        label_, splats = QUALITY_LEVELS[self._quality()][0], self._splat_budget()
+        rows.append(("Training", f"{label_}  ·  up to {splats:,} splats  ·  "
+                                 f"{self._steps_text(plan)}  ·  {splat}"))
+        rows.append(("Cleanup", f"floaters {self._floaters()}  ·  ignore moving {self._distraction()}"
+                                + ("  ·  one surface per pixel" if self._one_surface_extra() else "")
+                                + ("  ·  people masked" if self._people_masks_on() else "")
+                                + f"  ·  guidance {GUIDANCE_LABELS[self._guidance()]}"
+                                + (f" ({self.depth_weight.value():g})"
+                                   if self._guidance() in DEPTH_GUIDANCE else "")))
+        return rows
+
     def _update_summary(self):
         self.slots_label.setText(self.manager.slots_text())
         if self._current_plan is None:
             self.summary_label.setText("Choose a capture to start.")
+            self.job_rows.setText("Choose a capture to see the job.")
             return
         plan = self._current_plan
         item = self.gpu_list.currentItem()
         gpu = item.data(QtCore.Qt.UserRole + 2) if item and self._selected_gpu() else "no GPU yet"
-        options = f"  ·  {self._spirula_options_text()}" if self._engine() == "spirula" else ""
         self.summary_label.setText(
-            f"{ENGINE_LABELS[self._engine()]}{options}  ·  {self._source_description(plan)}  ·  "
-            f"{self._steps_text(plan)}  ·  {plan.volume_gb} GiB  ·  {gpu}"
+            f"{self._source_description(plan)}  ·  {QUALITY_LEVELS[self._quality()][0]}  ·  "
+            f"{self._steps_text(plan)}  ·  {gpu}"
+        )
+        rows = [("Capture", self._source_description(plan)), *self._settings_rows(plan),
+                ("Storage", f"{plan.volume_gb} GiB workspace")]
+        self.job_rows.setText(
+            "<table cellspacing='0' cellpadding='3'>"
+            + "".join(f"<tr><td style='padding-right:14px; color:{theme.OUTLINE}'>{html.escape(name)}</td>"
+                      f"<td>{html.escape(value)}</td></tr>" for name, value in rows)
+            + "</table>"
         )
 
     def _update_run_enabled(self, *_):
         selected = self._selected_gpu()
         self.run_button.setEnabled(selected is not None and self._current_plan is not None)
+        self.run_button.setText(
+            "Wait and start" if selected is not None and not self._selected_gpu_free() else "Start")
         item = self.gpu_list.currentItem()
         if selected is not None and item is not None:
             self.gpu_choice.setText(item.data(QtCore.Qt.UserRole + 1))
@@ -2532,10 +2644,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.gpu_list.clear()
         model = self._speed_model()
         spirula = self._engine() == "spirula"
-        splats = QUALITY_LEVELS[self._quality()][2]
+        splats = self._splat_budget()
         steps = self._effective_steps(plan)
         kind = "video" if plan.is_video else "photos"
         options = []
+        waiting = self.wait_for_gpu.isChecked()
+        queueable = []  # out of stock, but pickable because the job may wait
         for gpu in candidates:
             price = gpu["_hourly_price"]
             speed = model.speed(gpu["id"])
@@ -2561,19 +2675,29 @@ class MainWindow(QtWidgets.QMainWindow):
             item = QtWidgets.QListWidgetItem(text)
             item.setSizeHint(QtCore.QSize(0, 84))
             item.setToolTip(self._gpu_speed_tooltip(model, gpu["id"], estimate, kind, splats))
-            selection = (gpu["id"], gpu["_cloud_type"]) if gpu["_available"] else None
-            item.setData(QtCore.Qt.UserRole, selection)
-            item.setData(QtCore.Qt.UserRole + 1, f"{gpu['_display_name']}  ·  {details}")
+            item.setData(QtCore.Qt.UserRole, (gpu["id"], gpu["_cloud_type"]))
+            item.setData(QtCore.Qt.UserRole + 3, bool(gpu["_available"]))
+            waits = "" if gpu["_available"] else "  ·  waits until one is free"
+            item.setData(QtCore.Qt.UserRole + 1, f"{gpu['_display_name']}  ·  {details}{waits}")
             item.setData(QtCore.Qt.UserRole + 2, f"{gpu['_display_name']} at ${price:.3f}/hr")
             if not gpu["_available"]:
-                item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEnabled)
                 item.setForeground(QtGui.QColor(theme.OUTLINE))
+                if waiting:
+                    queueable.append(item)
+                else:
+                    item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEnabled)
             else:
                 options.append((rank, estimate.total_s if estimate else math.inf, item))
             self.gpu_list.addItem(item)
         if not candidates:
             self.gpu_list.addItem(self._placeholder_item("No GPUs match these limits right now."))
-        if options:
+        kept_waiting = [item for item in queueable if item.data(QtCore.Qt.UserRole) == previous]
+        if kept_waiting:
+            self.gpu_list.setCurrentItem(kept_waiting[0])
+            self.gpu_hint.setText(
+                "Your pick has no free card right now; the job waits for one and starts by itself."
+            )
+        elif options:
             # Picked for you: the lowest cost for this job; within 5% of it, the
             # quickest. "Change" shows the full list.
             best = min(rank for rank, _, _ in options)
@@ -2663,10 +2787,10 @@ class MainWindow(QtWidgets.QMainWindow):
         except (OSError, ValueError) as exc:
             self._error(str(exc))
             return
-        if self.fisheye.isChecked() and self._engine() != "spirula":
+        if self._fisheye() and self._engine() != "spirula":
             self._error("Fisheye photos need Spirula Studio. Switch the engine, or untick the fisheye option.")
             return
-        if self.object_scan.isChecked() and self._engine() != "spirula":
+        if self._subject() in ("object", "turntable") and self._engine() != "spirula":
             self._error("Object scans need Spirula Studio. Switch the engine, or untick object scan.")
             return
         if plan.is_mixed and self._engine() != "spirula":
@@ -2686,35 +2810,7 @@ class MainWindow(QtWidgets.QMainWindow):
         gpu_text = selected_item.text().splitlines()[0]
         rate = selected_item.text().splitlines()[1].split("  ·  ")[2]
         engine = self._engine()
-        rows = []
-        if plan.has_videos:
-            known = plan.video_info.duration_seconds > 0
-            rows.append(("Frames", f"{plan.extract_fps:g} per second of video"
-                         + (f"  ·  about {plan.frame_target:,}" if known else "")))
-        if engine == "spirula":
-            splat = {"3dgs": "Standard (3DGS)", "3dgut": "Lens-accurate (3DGUT)"}[self._primitive()]
-            rows.append(("Engine", f"Spirula Studio  ·  {splat}"))
-            label_, _steps, splats = QUALITY_LEVELS[self._quality()]
-            rows.append(("Quality", f"{label_}  ·  up to {splats:,} splats  ·  "
-                                    f"{self._steps_text(plan)}"))
-            rows.append(("Cleanup", f"floaters {self._floaters()}  ·  guidance "
-                                    f"{GUIDANCE_LABELS[self._guidance()]}"
-                                    + (f"  ·  ignore moving {self._distraction()}"
-                                       if self._distraction() != "off" else "")
-                                    + ("  ·  vignetting corrected"
-                                       if self.vignetting.isChecked() else "")))
-        else:
-            rows.append(("Engine", "Nerfstudio"))
-        if self.fisheye.isChecked():
-            rows.append(("Lens", f"fisheye, {self.fisheye_focal.value():g} mm"))
-        if engine == "spirula" and self._matcher() != "sift":
-            rows.append(("Matching", {"aliked": "Learned (ALIKED + LightGlue)  ·  about 10–15 min more solving",
-                                      "loma": "LoMa  ·  1.4 GB download, slowest solving"}[self._matcher()]))
-        if self.object_scan.isChecked() and engine == "spirula":
-            rows.append(("Object", "background cut away by AI masks"
-                         + ("  ·  turntable: masked before solving the cameras"
-                            if self.turntable.isChecked() else "")
-                         + "  ·  about 2–3 min extra"))
+        rows = self._settings_rows(plan)
         rows.append(("GPU", f"{gpu_text}  ·  {rate}"))
         rows.append(("Storage", f"{plan.volume_gb} GiB workspace"))
         if not confirm_summary(
@@ -2750,6 +2846,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     # A mixed job's source is the folder, so every video is extra.
                     **({"more_videos": plan.videos} if plan.kind == "mixed"
                        else {"more_videos": plan.videos[1:]} if len(plan.videos) > 1 else {}),
+                    **({"photo_folders": plan.photo_folders} if plan.photo_folders else {}),
+                    **({"wait_for_gpu": True} if self.wait_for_gpu.isChecked() else {}),
                 },
             )
         except ValueError as exc:
@@ -2788,6 +2886,7 @@ class MainWindow(QtWidgets.QMainWindow):
                                       alignment=QtCore.Qt.AlignHCenter)
         self._dock_buttons[job] = dock_button
         job.finished.connect(lambda _success: self._tick())
+        job.warning.connect(self._show_global)
         job.active_pod_changed.connect(lambda _pod: self._tick())
         if select:
             self.job_list.setCurrentItem(item)
@@ -2938,6 +3037,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def _manager_error(self, message: str):
         if message.startswith("GPU lookup failed"):
             self._error(message)
+            # The empty result already said "No GPU available within your limits",
+            # which points at the limits rather than the failed lookup.
+            self.gpu_choice.setText("Couldn't check RunPod.")
+            self.gpu_hint.setText("The GPU lookup failed (see the message above). Press Refresh to try again.")
         else:
             self._show_global(message, error=True)
 

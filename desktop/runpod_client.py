@@ -7,6 +7,7 @@ from urllib.parse import quote, urljoin
 from typing import Any, Optional
 
 import requests
+from urllib3.exceptions import NewConnectionError
 
 
 class RunPodError(RuntimeError):
@@ -21,7 +22,30 @@ class PodCreationUncertainError(RunPodError):
     pass
 
 
+class RunPodRateLimitError(RunPodError):
+    """RunPod answered 429; retry_after is its Retry-After in seconds, if it sent one."""
+
+    def __init__(self, message: str, retry_after: float | None = None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+def _never_connected(exc: requests.RequestException) -> bool:
+    """True when the request never reached RunPod (no network, DNS failure, connect
+    timeout), so sending it again cannot do anything twice."""
+    if isinstance(exc, requests.ConnectTimeout):
+        return True
+    if not isinstance(exc, requests.ConnectionError):
+        return False
+    reason = getattr(exc.args[0] if exc.args else None, "reason", None)
+    return isinstance(reason, NewConnectionError)
+
+
 class RunPodClient:
+    # How long a call keeps retrying while the network is down. Wi-Fi that drops
+    # for a few seconds to a minute otherwise fails jobs and leaves pods billing.
+    offline_retry_s = 120.0
+
     def __init__(self, api_key: str, graphql_url: str):
         if not api_key.strip():
             raise RunPodError("RunPod API key is empty.")
@@ -42,19 +66,44 @@ class RunPodClient:
     # Low-level GraphQL
     # ------------------------------------------------------------------
 
+    def _send(self, method: str, url: str, **kwargs) -> requests.Response:
+        """One HTTP request, sent again while the network is unreachable."""
+        deadline = time.monotonic() + self.offline_retry_s
+        delay = 2.0
+        while True:
+            try:
+                return self.session.request(method, url, **kwargs)
+            except requests.RequestException as exc:
+                if not _never_connected(exc) or time.monotonic() + delay > deadline:
+                    raise
+            time.sleep(delay)
+            delay = min(delay * 2, 15.0)
+
     def _graphql(
         self,
         query: str,
         variables: Optional[dict] = None,
     ) -> dict:
         try:
-            response = self.session.post(
-                self.graphql_url,
+            response = self._send(
+                "POST", self.graphql_url,
                 json={"query": query, "variables": variables or {}},
                 timeout=45,
             )
+            if response.status_code == 429:
+                try:
+                    retry_after = float(response.headers.get("Retry-After", ""))
+                except ValueError:
+                    retry_after = None
+                raise RunPodRateLimitError(
+                    "RunPod is limiting how often the app may ask; slowing down.", retry_after,
+                )
             response.raise_for_status()
             payload = response.json()
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            raise RunPodError(
+                "Couldn't reach RunPod. Check your internet connection, then try again."
+            ) from exc
         except requests.RequestException as exc:
             raise RunPodError(
                 f"RunPod API request failed: {exc}"
@@ -421,7 +470,7 @@ keepalive 0
         """Read pod lifecycle and direct SSH details from the REST v2 API."""
         url = self.rest_url + "pods/" + quote(pod_id, safe="")
         try:
-            response = self.session.get(url, timeout=20)
+            response = self._send("GET", url, timeout=20)
             if response.status_code == 404:
                 return None
             response.raise_for_status()

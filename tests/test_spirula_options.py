@@ -18,7 +18,8 @@ class SpirulaOptionTests(unittest.TestCase):
     def run_spirula(self, *, floaters="off", guidance="off", geometry_fails=False,
                     write_depths=True, preview=True, distraction="off",
                     crash_after_writing=False, train_fails_with_normals=False,
-                    sfm_crash=None):
+                    sfm_crash=None, one_surface=False, people_masks=False,
+                    masks_fail=False):
         commands: list[list[str]] = []
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -32,6 +33,15 @@ class SpirulaOptionTests(unittest.TestCase):
             def fake_run(args, *, cwd=None, ok_exit_codes=(0,), env=None):
                 commands.append(list(args))
                 verb = args[1]
+                if verb.endswith("people_masks.py"):
+                    if masks_fail:
+                        (processed / "masks").mkdir()
+                        raise RuntimeError("Command failed with exit code 1")
+                    (processed / "masks").mkdir()
+                    (processed / "masks" / "p0.png").write_bytes(b"m")
+                    (processed / "people_masks.json").write_text(
+                        '{"photos": 5, "with_people": 3, "masked_share": 0.03}')
+                    return 0
                 if verb == "sfm":
                     if sfm_crash == "before_writing":
                         return pipeline.SEGFAULT_EXIT
@@ -64,15 +74,21 @@ class SpirulaOptionTests(unittest.TestCase):
                 TRAIN_OUTPUT_DIR=train_dir, SOURCE_TYPE="images",
                 SPIRULA_FLOATERS=floaters, SPIRULA_GUIDANCE=guidance,
                 SPIRULA_DISTRACTION=distraction, SPIRULA_DEPTH_WEIGHT=0.07, SPIRULA_RESULT={}, PREVIEW=preview,
+                SPIRULA_ONE_SURFACE=one_surface, SPIRULA_PEOPLE_MASKS=people_masks,
+                OUTPUT_DIR=root / "output",
                 run_command=fake_run,
                 _spirula_install_packages=lambda: None,
                 _install_spirula=lambda: Path("/opt/spirula"),
                 _ensure_vulkan_gpu=lambda: None,
-            ), patch.object(pipeline.shutil, "which", return_value=None):
+            ), patch.object(pipeline.shutil, "which", return_value=None), \
+                    patch.object(pipeline.torch_env, "ensure", return_value=Path("/env/bin/python")):
                 pipeline._run_spirula(None)
                 used = pipeline.SPIRULA_RESULT.get("guidance_used")
                 leftovers = (processed / "normals").exists()
+                self.people = pipeline.SPIRULA_RESULT.get("people_masks", "not run")
+                self.masks_left = (processed / "masks").exists()
         self.trains = [command for command in commands if command[1] == "train"]
+        self.masking = [command for command in commands if command[1].endswith("people_masks.py")]
         train = self.trains[-1]
         geometry = [command for command in commands if command[1] == "geometry"]
         return train, geometry, used, leftovers
@@ -97,6 +113,21 @@ class SpirulaOptionTests(unittest.TestCase):
         train, _, _, _ = self.run_spirula(distraction="strong", floaters="strong")
         self.assertEqual(self.flag(train, "--distraction-robustness"), "strong")
         self.assertEqual(self.flag(train, "--floater-suppression"), "strong")
+
+    def test_one_surface_without_guidance(self):
+        train, geometry, used, _ = self.run_spirula(one_surface=True)
+        self.assertEqual(geometry, [])
+        self.assertEqual(used, "off")
+        self.assertEqual(self.flag(train, "--depth-distortion-reg"), "0.01")
+        self.assertEqual(self.flag(train, "--normal-distortion-reg"), "0.01")
+        self.assertEqual(self.flag(train, "--load-depths"), "0")
+        self.assertEqual(self.flag(train, "--load-normals"), "0")
+        plain, _, _, _ = self.run_spirula()
+        self.assertNotIn("--depth-distortion-reg", plain)
+
+    def test_one_surface_with_guidance_is_added_once(self):
+        train, _, _, _ = self.run_spirula(guidance="surfaces", one_surface=True)
+        self.assertEqual(train.count("--depth-distortion-reg"), 1)
 
     def test_preview_off_disables_the_viewer(self):
         train, _, _, _ = self.run_spirula(preview=False)
@@ -154,6 +185,33 @@ class SpirulaOptionTests(unittest.TestCase):
         self.assertEqual(self.flag(train, "--load-normals"), "0")
 
 
+    def test_people_masks_run_after_the_solve(self):
+        train, _, _, _ = self.run_spirula(people_masks=True)
+        self.assertEqual(len(self.masking), 1)
+        self.assertEqual(self.masking[0][0], "/env/bin/python")
+        self.assertIn("--check-sheet", self.masking[0])
+        self.assertTrue(self.flag(self.masking[0], "--check-sheet").endswith("people_masks.jpg"))
+        self.assertEqual(self.people["with_people"], 3)
+        self.assertTrue(self.masks_left)
+        self.assertEqual(train[1], "train")
+
+    def test_failed_people_masks_train_on_whole_photos(self):
+        train, _, _, _ = self.run_spirula(people_masks=True, masks_fail=True)
+        self.assertIsNone(self.people)
+        self.assertFalse(self.masks_left)
+        self.assertEqual(train[1], "train")
+
+    def test_people_masks_skip_object_scans(self):
+        with patch.multiple(pipeline, SPIRULA_OBJECT=True,
+                            _spirula_object_masks=lambda spirula, dataset: 5):
+            self.run_spirula(people_masks=True)
+        self.assertEqual(self.masking, [])
+        self.assertEqual(self.people, "not run")
+
+    def test_people_masks_off_by_default(self):
+        self.run_spirula()
+        self.assertEqual(self.masking, [])
+
     def test_sfm_crash_after_writing_the_model_keeps_it(self):
         # Spirula 2026.9.30 segfaults on exit after AI matchers (ALIKED + LightGlue, LoMa).
         train, _, _, _ = self.run_spirula(sfm_crash="after_writing")
@@ -189,12 +247,14 @@ class RunPipelineCommandTests(unittest.TestCase):
                 patch("scp_client._stream_output", lambda process, log: None):
             client.run_pipeline(10, 1, lambda line: None, engine="spirula",
                                 spirula_floaters="mild", spirula_guidance="depth",
-                                spirula_depth_weight=0.1)
+                                spirula_depth_weight=0.1, spirula_people_masks=True)
             client.run_pipeline(10, 1, lambda line: None, engine="nerfstudio",
                                 spirula_floaters="mild")
         self.assertIn("PIPELINE_SPIRULA_FLOATERS=mild", captured[0])
         self.assertIn("PIPELINE_SPIRULA_GUIDANCE=depth", captured[0])
         self.assertIn("PIPELINE_SPIRULA_DEPTH_WEIGHT=0.1 ", captured[0])
+        self.assertIn("PIPELINE_SPIRULA_ONE_SURFACE=0 ", captured[0])
+        self.assertIn("PIPELINE_SPIRULA_PEOPLE_MASKS=1 ", captured[0])
         self.assertNotIn("SPIRULA_FLOATERS", captured[1])
         with self.assertRaises(TransferError):
             client.run_pipeline(10, 1, lambda line: None, engine="spirula",
