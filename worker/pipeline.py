@@ -22,6 +22,7 @@ import urllib.parse
 import urllib.request
 import zipfile
 from pathlib import Path
+from typing import Callable
 
 import torch_env
 
@@ -216,7 +217,8 @@ def _low_space() -> str | None:
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
-def _forward_output(process: subprocess.Popen[bytes], command_name: str) -> None:
+def _forward_output(process: subprocess.Popen[bytes], command_name: str,
+                    on_line: Callable[[str], None] | None = None) -> None:
     """Forward child output and progress redraws without waiting for a newline."""
     assert process.stdout is not None
     decoder = codecs.getincrementaldecoder("utf-8")("replace")
@@ -229,6 +231,8 @@ def _forward_output(process: subprocess.Popen[bytes], command_name: str) -> None
         if line:
             print(line, flush=True)
             last_log = time.monotonic()
+            if on_line:
+                on_line(line)
 
     with selectors.DefaultSelector() as selector:
         selector.register(process.stdout, selectors.EVENT_READ)
@@ -268,7 +272,12 @@ def run_command(
     cwd: Path | None = None,
     ok_exit_codes: tuple[int, ...] = (0,),
     env: dict[str, str] | None = None,
+    finished_marker: str | None = None,
+    exit_grace: float = 300,
 ) -> int:
+    """Run a tool, forwarding its output. With finished_marker: once the tool has printed
+    it, its work is saved, so if it then stays silent for exit_grace seconds without
+    exiting, it is stopped and counts as a success."""
     printable = " ".join(_quote(arg) for arg in args)
     print(f"[cmd] {printable}", flush=True)
 
@@ -289,6 +298,13 @@ def run_command(
     )
     stop = threading.Event()
     low_space_error: list[str] = []
+    # When the finished marker was printed, then the time of the latest output after it.
+    finished: list[float] = []
+    stopped_after_finish = threading.Event()
+
+    def on_line(line: str) -> None:
+        if finished or (finished_marker and finished_marker in line):
+            finished[:] = [time.monotonic()]
 
     def watch_space() -> None:
         while not stop.wait(2):
@@ -303,13 +319,31 @@ def run_command(
                 except ProcessLookupError:
                     pass
                 return
+            # Spirula has hung for hours after "Training complete" (its preview server
+            # waiting on an idle connection), billing the pod with the splat already saved.
+            if finished and process.poll() is None and time.monotonic() - finished[0] >= exit_grace:
+                print(f"[pipeline] {Path(args[0]).name} printed {finished_marker!r} but has not "
+                      f"exited in {int(exit_grace)} s; stopping it (its results are saved).",
+                      flush=True)
+                stopped_after_finish.set()
+                for sig in (signal.SIGTERM, signal.SIGKILL):
+                    try:
+                        os.killpg(process.pid, sig)
+                    except ProcessLookupError:
+                        return
+                    try:
+                        process.wait(timeout=15)
+                        return
+                    except subprocess.TimeoutExpired:
+                        continue
+                return
 
     watcher = threading.Thread(target=watch_space, daemon=True)
     watcher.start()
     try:
         if process.stdout is None:
             raise RuntimeError("Could not read child-process output.")
-        _forward_output(process, args[0])
+        _forward_output(process, args[0], on_line)
         exit_code = process.wait()
     finally:
         stop.set()
@@ -322,6 +356,8 @@ def run_command(
             process.wait()
     if low_space_error:
         raise RuntimeError(low_space_error[0])
+    if stopped_after_finish.is_set():
+        return 0
     if exit_code not in ok_exit_codes:
         raise RuntimeError(
             f"Command failed with exit code {exit_code}: {printable}"
@@ -1702,6 +1738,7 @@ def _run_spirula(videos: list[Path]) -> tuple[int, int, Path, float]:
                     *cleanup,
                 ],
                 cwd=JOB_ROOT,
+                finished_marker="Training complete",
             )
         TRAINING_VRAM.update(vram.summary() or {})
 

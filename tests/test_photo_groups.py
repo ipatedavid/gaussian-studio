@@ -140,7 +140,7 @@ class PodStagingTests(unittest.TestCase):
             if groups is not None:
                 groups_file.write_text(json.dumps({"groups": groups}))
 
-            def fake_run(args, *, cwd=None, ok_exit_codes=(0,), env=None):
+            def fake_run(args, *, cwd=None, ok_exit_codes=(0,), env=None, **_options):
                 commands.append(list(args))
                 if args[1] == "sfm":
                     colmap_model(processed / "sparse" / "0", {1: 1915.0, 2: 1953.3}, [

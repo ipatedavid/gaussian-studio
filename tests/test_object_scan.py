@@ -36,7 +36,7 @@ class MaskTests(unittest.TestCase):
             root = Path(tmp)
             dataset = self.make_dataset(root, layout)
 
-            def fake_run(args, *, cwd=None, ok_exit_codes=(0,), env=None):
+            def fake_run(args, *, cwd=None, ok_exit_codes=(0,), env=None, **_options):
                 commands.append(list(args))
                 if fail:
                     raise RuntimeError("Command failed with exit code 1")
@@ -235,7 +235,7 @@ class MatcherTests(unittest.TestCase):
                 (inputs / f"p{index}.jpg").write_bytes(b"jpg")
             processed, train_dir = root / "processed", root / "train"
 
-            def fake_run(args, *, cwd=None, ok_exit_codes=(0,), env=None):
+            def fake_run(args, *, cwd=None, ok_exit_codes=(0,), env=None, **_options):
                 commands.append(list(args))
                 if args[1] == "sfm":
                     model = processed / "sparse" / "0"

@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -37,6 +38,44 @@ class WorkerOutputTests(unittest.TestCase):
             output.getvalue().splitlines(),
             ["features 1/3", "features 2/3", "features 3/3"],
         )
+
+
+@unittest.skipIf(os.name == "nt", "pod-side code: pods run Linux")
+class FinishedButHungTests(unittest.TestCase):
+    """A trainer that prints that it is done but never exits is stopped, not waited on."""
+
+    def setUp(self):
+        space = patch.object(pipeline, "_low_space", return_value=None)  # no /workspace here
+        space.start()
+        self.addCleanup(space.stop)
+
+    def run_child(self, script: str, grace: float) -> tuple[int, str, float]:
+        output = io.StringIO()
+        started = time.monotonic()
+        with redirect_stdout(output):
+            code = pipeline.run_command([sys.executable, "-c", script],
+                                        finished_marker="Training complete", exit_grace=grace)
+        return code, output.getvalue(), time.monotonic() - started
+
+    def test_silent_after_finishing_is_stopped_and_counts_as_done(self):
+        code, output, took = self.run_child(
+            "import time; print('Training complete. Steps: 10', flush=True); time.sleep(600)", 1)
+        self.assertEqual(code, 0)
+        self.assertIn("has not exited in 1 s; stopping it", output)
+        self.assertLess(took, 30)
+
+    def test_output_after_finishing_restarts_the_wait(self):
+        code, output, _ = self.run_child(
+            "import time\nprint('Training complete', flush=True)\n"
+            "for i in range(4):\n    time.sleep(0.8); print('eval', i, flush=True)\n", 1.5)
+        self.assertEqual(code, 0)
+        self.assertNotIn("stopping it", output)
+        self.assertIn("eval 3", output)
+
+    def test_without_the_marker_failures_still_fail(self):
+        with self.assertRaises(RuntimeError), redirect_stdout(io.StringIO()):
+            pipeline.run_command([sys.executable, "-c", "print('step 1'); raise SystemExit(3)"],
+                                 finished_marker="Training complete", exit_grace=1)
 
 
 class VideoPipelineTests(unittest.TestCase):

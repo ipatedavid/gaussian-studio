@@ -81,7 +81,7 @@ class PodStagingTests(unittest.TestCase):
             for path in paths:
                 path.write_bytes(b"video")
 
-            def fake_run(args, *, cwd=None, ok_exit_codes=(0,), env=None):
+            def fake_run(args, *, cwd=None, ok_exit_codes=(0,), env=None, **_options):
                 commands.append(list(args))
                 if args[1] == "sam":
                     out = Path(args[args.index("-o") + 1])

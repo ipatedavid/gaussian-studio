@@ -31,7 +31,7 @@ class SpirulaOptionTests(unittest.TestCase):
             processed = root / "processed"
             train_dir = root / "train"
 
-            def fake_run(args, *, cwd=None, ok_exit_codes=(0,), env=None):
+            def fake_run(args, *, cwd=None, ok_exit_codes=(0,), env=None, **_options):
                 commands.append(list(args))
                 verb = args[1]
                 if verb.endswith("people_masks.py"):
